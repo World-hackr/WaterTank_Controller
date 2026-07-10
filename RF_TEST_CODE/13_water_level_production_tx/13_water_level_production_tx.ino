@@ -2,13 +2,13 @@
 #include <avr/wdt.h>
 #include <avr/sleep.h>
 #include <avr/interrupt.h>
-#include <avr/eeprom.h>
 #include <util/delay.h>
 
-#define PROBE_SENSE PIN_PA6 // Pin 2
-#define PROBE_DRIVE PIN_PA7 // Pin 3
-#define TX_DATA     PIN_PA1 // Pin 4
-#define BTN_PIN     PIN_PA3 // Pin 7 (Remapped button, replaces Pin 5 PA2)
+#define PROBE_SENSE PIN_PA6
+#define PROBE_DRIVE PIN_PA7
+#define TX_DATA     PIN_PA1
+#define TEST_LED    PIN_PA3
+#define BTN_PIN     PIN_PA2 // PA2 physical Pin 5 button
 
 #define BIT_US 1000
 #define REPEATS_PER_PACKET 4
@@ -17,10 +17,9 @@
 #define STABLE_REQUIRED_READS 2
 #define PACKET_GAP_MS 35
 
-// Protocol constants
+// Message types
 #define MSG_AUTO_REPORT 0x01
 #define MSG_MANUAL_CMD  0x02
-#define MSG_PAIRING     0x03
 
 // Flags
 #define FLAG_LEVEL_CHANGED 0x01
@@ -32,19 +31,15 @@
 #define FLAG_DRY_WARNING   0x40
 #define FLAG_OVERFLOW_WARNING 0x80
 
-// Ticks (8.2 second intervals)
-#define DEFAULT_FILL_TIMEOUT_TICKS 220 // ~30 minutes
-#define MIN_FILL_TIMEOUT_TICKS     110 // ~15 minutes
-#define MAX_FILL_TIMEOUT_TICKS     440 // ~60 minutes
+// Timing in Ticks (8 second intervals)
+#define DEFAULT_FILL_TIMEOUT_TICKS 225 // 30 minutes
+#define MIN_FILL_TIMEOUT_TICKS     112 // 15 minutes
+#define MAX_FILL_TIMEOUT_TICKS     450 // 60 minutes
 #define DRY_REPORT_WAKE_COUNT      5   // 40 seconds
 #define DRY_RETRY_WAKE_INTERVAL    150 // 20 minutes
 #define OVERFLOW_REPORT_WAKE_COUNT 10  // 80 seconds
 
-// EEPROM addresses
-#define EE_ACT_ADDR 0x00 // 0x55 if activated, 0xFF if first startup
-
-// XTEA 128-bit Key
-static const uint32_t XTEA_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
+static const uint64_t AUTH_KEY = 0x7b3a91d04c8e25f1ULL;
 
 // Calibrated ADC Probe levels
 #define ADC_LEVEL_1 160
@@ -63,6 +58,7 @@ uint8_t reportedLevel = 0;
 uint8_t candidateLevel = 0;
 uint8_t candidateCount = 0;
 bool firstReport = true;
+bool isActivated = false;
 
 // State Tracking
 bool manualMode = false;
@@ -70,36 +66,63 @@ bool manualOn = false;
 bool activeFilling = false;
 uint16_t fillTimerTicks = 0;
 uint16_t allowedFillTicks = DEFAULT_FILL_TIMEOUT_TICKS;
-uint16_t learnedFillTicks = 0;
+uint16_t learnedFillTicks = 0; // Learned value in RAM
 
 // Watchdog/PIT Counter tracking
 uint16_t dryWakeCount = 0;
 uint16_t overflowWakeCount = 0;
 
-// PIT 1.024-second wake counter
+// PIT 1-second wake counter (8 wakes = 8 seconds)
 volatile uint8_t oneSecondWakes = 0;
-
-// Reads 3 bytes from the Silicon Serial Number (Signature Row) starting at 0x1103
-static void get_silicon_id(uint8_t *id) {
-  id[0] = *(volatile uint8_t*)(0x1103);
-  id[1] = *(volatile uint8_t*)(0x1104);
-  id[2] = *(volatile uint8_t*)(0x1105);
-}
 
 static void set_clock_full_speed() {
   CPU_CCP = CCP_IOREG_gc;
   CLKCTRL.MCLKCTRLB = 0x00;
 }
 
-static void xtea_encrypt(uint32_t num_rounds, uint32_t v[2], uint32_t const k[4]) {
-  uint32_t i;
-  uint32_t v0 = v[0], v1 = v[1], sum = 0, delta = 0x9E3779B9;
-  for (i = 0; i < num_rounds; i++) {
-    v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + k[sum & 3]);
-    sum += delta;
-    v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + k[(sum >> 11) & 3]);
+static uint64_t rotl64(uint64_t value, uint8_t shift) {
+  return (value << shift) | (value >> (64 - shift));
+}
+
+static uint64_t read64le(const uint8_t *p) {
+  uint64_t value = 0;
+  for (uint8_t i = 0; i < 8; i++) value |= ((uint64_t)p[i]) << (8 * i);
+  return value;
+}
+
+static void write64le(uint8_t *out, uint64_t value) {
+  for (uint8_t i = 0; i < 8; i++) out[i] = (uint8_t)(value >> (8 * i));
+}
+
+static void sip_round(uint64_t &v0, uint64_t &v1, uint64_t &v2, uint64_t &v3) {
+  v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+  v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+  v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+  v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+}
+
+static uint64_t auth64_tag(const uint8_t *message, uint8_t length, uint64_t key) {
+  uint64_t k0 = key;
+  uint64_t k1 = rotl64(key ^ 0xa5a5a5a55a5a5a5aULL, 17);
+  uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+  uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+  uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+  uint64_t v3 = 0x7465646279746573ULL ^ k1;
+
+  uint8_t offset = 0;
+  while ((length - offset) >= 8) {
+    uint64_t m = read64le(message + offset);
+    v3 ^= m; sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3); v0 ^= m;
+    offset += 8;
   }
-  v[0] = v0; v[1] = v1;
+
+  uint64_t b = ((uint64_t)length) << 56;
+  for (uint8_t i = 0; i < (length - offset); i++) b |= ((uint64_t)message[offset + i]) << (8 * i);
+  v3 ^= b; sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3); v0 ^= b;
+  v2 ^= 0xff;
+  sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3);
+  sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3);
+  return v0 ^ v1 ^ v2 ^ v3;
 }
 
 static uint16_t crc16_update(uint16_t crc, uint8_t data) {
@@ -110,6 +133,7 @@ static uint16_t crc16_update(uint16_t crc, uint8_t data) {
 
 static void tx_write(bool value) {
   digitalWrite(TX_DATA, value ? HIGH : LOW);
+  digitalWrite(TEST_LED, value ? HIGH : LOW);
 }
 
 static void send_symbol(uint8_t symbol) {
@@ -217,57 +241,24 @@ static uint8_t read_filtered_level(bool *changed) {
   return reportedLevel;
 }
 
-static uint8_t read_battery_code() {
-  VREF.CTRLA = VREF_ADC0REFSEL_1V1_gc;
-  delayMicroseconds(500);
-
-  ADC0.CTRLC = ADC_REFSEL_VDDREF_gc | ADC_PRESC_DIV16_gc;
-  ADC0.MUXPOS = ADC_MUXPOS_INTREF_gc;
-  ADC0.CTRLA = ADC_ENABLE_bm;
-
-  ADC0.INTFLAGS = ADC_RESRDY_bm;
-  ADC0.COMMAND = ADC_STCONV_bm;
-  while (!(ADC0.INTFLAGS & ADC_RESRDY_bm));
-
-  ADC0.INTFLAGS = ADC_RESRDY_bm;
-  ADC0.COMMAND = ADC_STCONV_bm;
-  while (!(ADC0.INTFLAGS & ADC_RESRDY_bm));
-
-  uint16_t adc = ADC0.RES;
-  ADC0.CTRLA = 0;
-
-  if (adc == 0) return 0;
-  uint32_t vcc_mv = (1125300UL / adc);
-  return (uint8_t)(vcc_mv / 20); // 20mV scaling, e.g. 4.5V = 225
-}
-
-static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, uint8_t extraFlags) {
-  uint8_t plaintext[8];
-  uint8_t battery = read_battery_code();
+static void build_payload(uint8_t *payload, uint8_t level, bool levelChanged, uint8_t msgType, uint8_t extraFlags) {
+  uint8_t battery = 0; // Battery measurement placeholder
   uint8_t flags = extraFlags;
   if (levelChanged) flags |= FLAG_LEVEL_CHANGED;
-  if (battery != 0 && battery < 165) flags |= FLAG_LOW_BATTERY; // <3.3V
 
-  plaintext[0] = msgType;
-  plaintext[1] = sequenceId;
-  plaintext[2] = level;
-  plaintext[3] = battery;
-  plaintext[4] = flags;
-  get_silicon_id(plaintext + 5); // Bytes 5-7 hold the unique ID
-
-  // Encrypt the 8-byte plaintext block in-place
-  xtea_encrypt(32, (uint32_t*)plaintext, XTEA_KEY);
-
-  for (uint8_t repeat = 0; repeat < REPEATS_PER_PACKET; repeat++) {
-    radio_send(plaintext, 8);
-    delay(PACKET_GAP_MS);
-  }
-  sequenceId++;
+  payload[0] = msgType;
+  payload[1] = sequenceId;
+  payload[2] = level;
+  payload[3] = battery;
+  payload[4] = flags;
+  write64le(payload + 5, auth64_tag(payload, 5, AUTH_KEY));
 }
 
+// RTC Periodic Interrupt Timer (PIT) configurations
 static void configure_pit_sleep() {
+  // Configure PIT to interrupt every 1.024 seconds (32768 cycles of internal OSCULP32K)
   RTC.PITINTCTRL = RTC_PI_bm; // Enable Periodic Interrupt
-  RTC.PITCTRLA = RTC_PERIOD_CYC32768_gc | RTC_PITEN_bm; // ~1s period
+  RTC.PITCTRLA = RTC_PERIOD_CYC32768_gc | RTC_PITEN_bm; // Enable PIT with 32768 cycles (~1s)
 }
 
 static void configure_pit_off() {
@@ -280,7 +271,8 @@ ISR(RTC_PIT_vect) {
 }
 
 ISR(PORTA_PORT_vect) {
-  PORTA.INTFLAGS = PIN3_bm; // Clear Button interrupt flag
+  // Wakeup on button Pin Change
+  PORTA.INTFLAGS = PIN2_bm; // Clear flag
 }
 
 static bool check_button_held(uint16_t ms) {
@@ -301,30 +293,32 @@ void setup() {
   digitalWrite(PROBE_DRIVE, LOW);
   pinMode(PROBE_SENSE, INPUT);
   pinMode(TX_DATA, OUTPUT);
+  pinMode(TEST_LED, OUTPUT);
   tx_write(false);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
   
-  uint8_t activationStatus = eeprom_read_byte((const uint8_t*)EE_ACT_ADDR);
-
-  // First Startup Safety Block: waits for 10-second activation hold
-  if (activationStatus != 0x55) {
-    while (true) {
-      if (digitalRead(BTN_PIN) == LOW) {
-        if (check_button_held(10000)) {
-          eeprom_write_byte((uint8_t*)EE_ACT_ADDR, 0x55);
-          // Pairing command broadcast
-          encrypt_and_send(0, false, MSG_PAIRING, 0);
-          break;
+  // Power-up safety block: wait for 10-second activation hold
+  while (!isActivated) {
+    if (digitalRead(BTN_PIN) == LOW) {
+      if (check_button_held(10000)) {
+        isActivated = true;
+        // Visual confirmation of activation
+        for (uint8_t i = 0; i < 4; i++) {
+          tx_write(true);
+          _delay_ms(100);
+          tx_write(false);
+          _delay_ms(100);
         }
       }
-      PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Button wake
-      set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-      sei();
-      sleep_mode();
-      cli();
-      PORTA.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
     }
+    // Deep Sleep until button press
+    PORTA.PIN2CTRL = PORT_ISC_LEVEL_gc; // Low level interrupt to wake
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sei();
+    sleep_mode();
+    cli();
+    PORTA.PIN2CTRL = PORT_ISC_INPUT_DISABLE_gc;
   }
   
   configure_pit_sleep();
@@ -333,50 +327,70 @@ void setup() {
 void loop() {
   sei();
   
-  // Debounced Button checks
+  // debounced button hold checks
   if (digitalRead(BTN_PIN) == LOW) {
     if (check_button_held(5000)) {
-      // 5-second hold: Toggle AUTO/MANUAL mode
+      // 5-second hold: Toggle AUTO/MANUAL Mode
       manualMode = !manualMode;
       manualOn = false;
       activeFilling = false;
       
+      // Flash LED: 2 blinks for AUTO, 4 blinks for MANUAL
+      uint8_t blinks = manualMode ? 4 : 2;
+      for (uint8_t i = 0; i < blinks; i++) {
+        tx_write(true);
+        _delay_ms(200);
+        tx_write(false);
+        _delay_ms(200);
+      }
+      
       if (manualMode) {
-        configure_pit_off();
+        configure_pit_off(); // Sleep without PIT in manual
       } else {
         configure_pit_sleep();
       }
-      _delay_ms(300);
     } else {
-      // Short press: Toggle MANUAL State
+      // Short press: MANUAL Toggle Command
       if (manualMode) {
         manualOn = !manualOn;
-        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_TOGGLE);
+        uint8_t flags = FLAG_MANUAL_MODE | FLAG_MANUAL_TOGGLE;
+        uint8_t payload[13];
+        build_payload(payload, reportedLevel, false, MSG_MANUAL_CMD, flags);
+        
+        // Transmit toggles aggressively for reliability
+        for (uint8_t r = 0; r < 4; r++) { // 4 repeats per packet
+          radio_send(payload, sizeof(payload));
+          _delay_ms(PACKET_GAP_MS);
+        }
         
         if (manualOn) {
-          configure_pit_sleep();
+          configure_pit_sleep(); // Enable PIT for 8s keepalive
         } else {
           configure_pit_off();
         }
-        _delay_ms(300);
       }
     }
   }
 
-  // Wakes up logic every 8 wakes (8.2 seconds)
+  // Only run main transmitter logic if we have reached the 8-second tick (8 wakes)
+  // or if we are in Manual Sleep where WDT/PIT is OFF
   if (oneSecondWakes >= 8 || (manualMode && !manualOn)) {
-    oneSecondWakes = 0;
+    oneSecondWakes = 0; // Reset tick counter
 
     if (manualMode) {
       if (manualOn) {
         // Send manual keepalive
-        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_KEEP);
+        uint8_t flags = FLAG_MANUAL_MODE | FLAG_MANUAL_KEEP;
+        uint8_t payload[13];
+        build_payload(payload, reportedLevel, false, MSG_MANUAL_CMD, flags);
+        radio_send(payload, sizeof(payload));
       }
     } else {
-      // Normal Auto water level checks
+      // Normal Auto Water Level Mode
       bool levelChanged = false;
       uint8_t level = read_filtered_level(&levelChanged);
 
+      // Adaptive Filling Tracking
       if (level <= 1) {
         if (!activeFilling) {
           activeFilling = true;
@@ -386,36 +400,52 @@ void loop() {
 
       if (activeFilling) {
         fillTimerTicks++;
+        if (levelChanged && level > 1) {
+          // We are rising, update progress
+        }
         if (level >= 4) {
+          // Successful Fill! Update learned average
           activeFilling = false;
           if (learnedFillTicks == 0) {
             learnedFillTicks = fillTimerTicks;
           } else {
             learnedFillTicks = (learnedFillTicks * 3 + fillTimerTicks) / 4;
           }
+          // Recalculate adaptive threshold (clamp between 15-60 mins)
           allowedFillTicks = learnedFillTicks * 2;
           if (allowedFillTicks < MIN_FILL_TIMEOUT_TICKS) allowedFillTicks = MIN_FILL_TIMEOUT_TICKS;
           if (allowedFillTicks > MAX_FILL_TIMEOUT_TICKS) allowedFillTicks = MAX_FILL_TIMEOUT_TICKS;
         }
         
+        // Check for Timeout
         if (fillTimerTicks >= allowedFillTicks) {
           activeFilling = false;
-          encrypt_and_send(level, false, MSG_AUTO_REPORT, FLAG_FILL_TIMEOUT);
+          // Transmit fill timeout fault aggressively
+          uint8_t payload[13];
+          build_payload(payload, level, false, MSG_AUTO_REPORT, FLAG_FILL_TIMEOUT);
+          for (uint8_t r = 0; r < 4; r++) {
+            radio_send(payload, sizeof(payload));
+            _delay_ms(PACKET_GAP_MS);
+          }
         }
       }
 
-      // Transmit requirement decision
+      // Determine transmit requirement
       bool shouldSend = false;
       uint8_t extraFlags = 0;
 
       if (levelChanged) {
         shouldSend = true;
-        if (level == 0) dryWakeCount = 0;
-        if (level == 5) overflowWakeCount = 0;
+        if (level == 0) {
+          dryWakeCount = 0;
+        }
+        if (level == 5) {
+          overflowWakeCount = 0;
+        }
       } else if (activeFilling) {
-        shouldSend = true;
-        // The packet itself acts as the keepalive, no special flag byte is needed
+        shouldSend = true; // Send keepalive every 8 seconds during filling
       } else if (level == 0) {
+        // Dry State: Send for 5 wakes, then retry once every 20 minutes
         if (dryWakeCount < DRY_REPORT_WAKE_COUNT) {
           shouldSend = true;
           dryWakeCount++;
@@ -423,11 +453,12 @@ void loop() {
           dryWakeCount++;
           if (dryWakeCount >= DRY_RETRY_WAKE_INTERVAL) {
             shouldSend = true;
-            dryWakeCount = DRY_REPORT_WAKE_COUNT;
+            dryWakeCount = DRY_REPORT_WAKE_COUNT; // Loop retry count
           }
         }
         extraFlags |= FLAG_DRY_WARNING;
       } else if (level == 5) {
+        // Overflow State: Send for 10 wakes, then silent
         if (overflowWakeCount < OVERFLOW_REPORT_WAKE_COUNT) {
           shouldSend = true;
           overflowWakeCount++;
@@ -436,20 +467,27 @@ void loop() {
       }
 
       if (shouldSend) {
-        encrypt_and_send(level, levelChanged, MSG_AUTO_REPORT, extraFlags);
+        uint8_t payload[13];
+        build_payload(payload, level, levelChanged, MSG_AUTO_REPORT, extraFlags);
+        for (uint8_t repeat = 0; repeat < REPEATS_PER_PACKET; repeat++) {
+          radio_send(payload, sizeof(payload));
+          _delay_ms(PACKET_GAP_MS);
+        }
+        sequenceId++;
       }
     }
   }
 
-  // Configure sleep wakes
+  // Sleep config
   if (manualMode && !manualOn) {
-    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Button wake only
+    PORTA.PIN2CTRL = PORT_ISC_LEVEL_gc; // Button wake only
   } else {
-    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Wake on button OR PIT tick
+    PORTA.PIN2CTRL = PORT_ISC_LEVEL_gc; // Wake on button OR RTC/PIT interrupt
   }
   
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_mode();
   
-  PORTA.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
+  // Wake Up -> Disable Pin interrupts
+  PORTA.PIN2CTRL = PORT_ISC_INPUT_DISABLE_gc;
 }

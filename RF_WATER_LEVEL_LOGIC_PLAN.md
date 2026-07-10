@@ -2,6 +2,38 @@
 
 This note records the current design discussion for the ATtiny402 RF water tank controller.
 
+## Canonical Decisions
+
+These rules override older experiments and summaries:
+
+```text
+No normal idle heartbeat.
+TX wakes every 8 seconds to check level, but does not transmit if level is unchanged and nothing important is happening.
+On ATtiny402, implement the 8-second wake tick with RTC/PIT sleep wake, not a WDT interrupt. The WDT is reset-oriented on this target and does not expose a normal `WDT_vect` interrupt in the installed device header.
+RF lost is only a fault while RX is expecting packets during automatic filling or manual ON.
+RX must not enter permanent FAULT_LOCKOUT just because no idle packet arrived.
+Level 1 starts motor.
+Levels 2 and 3 hold previous motor state.
+Level 4 stops motor normally.
+Level 5 is overflow warning and also stops motor.
+Manual mode is separate from automatic mode.
+Manual ON max runtime is 10 minutes on RX.
+Current RF security is authentication, not encryption.
+Do not add parity unless real testing proves CRC/repeats are insufficient.
+```
+
+Do not implement these rejected/obsolete ideas:
+
+```text
+Do not send a 72 second normal heartbeat.
+Do not use a 45 second global RF-loss timeout while idle.
+Do not make level 2 start the motor.
+Do not make level 5 the normal full stop level.
+Do not use LED 6 only as a fault LED; LED 6 is part of the 6-level bar.
+Do not make PUMPING a permanent lockout state.
+Do not claim the packet is encrypted unless encryption is actually added.
+```
+
 ## Hardware Roles
 
 TX board:
@@ -58,9 +90,9 @@ Reasoning:
 - Level 4 is the normal full point where the motor should stop.
 - Level 5 is not the normal stop point; it is an overflow warning level. It should also force motor OFF.
 
-When level 5 is detected, TX should send the motor-off/overflow packet aggressively for the next 10 watchdog wakes. With an 8 second wake interval, this means about 80 seconds of repeated stop/overflow reporting.
+When level 5 is detected, TX should send the motor-off/overflow packet aggressively for the next 10 sleep wakes. With an 8 second wake interval, this means about 80 seconds of repeated stop/overflow reporting.
 
-When level 0 is detected, TX should send the dry/start packet for the next 5 watchdog wakes. With an 8 second wake interval, this means about 40 seconds of repeated dry/start reporting.
+When level 0 is detected, TX should send the dry/start packet for the next 5 sleep wakes. With an 8 second wake interval, this means about 40 seconds of repeated dry/start reporting.
 
 After the first 5 dry packets, if the tank is still dry and unchanged, TX should send one dry retry packet every 20 minutes. This gives the system a recovery path after a motor/RX problem is fixed without spending much battery.
 
@@ -74,7 +106,7 @@ OVERFLOW_REPORT_WAKE_COUNT = 10
 RF_MISSED_FILL_PACKETS = 3
 ```
 
-With an 8 second watchdog wake:
+With an 8 second sleep wake:
 
 ```text
 DRY_RETRY_WAKE_INTERVAL = 150 wakes = 20 minutes
@@ -113,7 +145,7 @@ This avoids automatic restart after a damaged pump or dry source condition.
 
 TX must be conservative with power.
 
-Use watchdog sleep:
+Use low-power timed sleep:
 
 ```text
 Sleep most of the time.
@@ -146,7 +178,7 @@ Example tick conversions:
 
 ## TX RF Send Schedule
 
-RF transmission uses much more power than simple counters, so do not transmit every watchdog wake unless needed.
+RF transmission uses much more power than simple counters, so do not transmit every 8-second wake unless needed.
 
 Suggested schedule:
 
@@ -201,7 +233,7 @@ If level >= 4:
 If level >= 5:
   overflow warning
   force motor-off flag
-  send overflow/stop packet for 10 watchdog wakes
+  send overflow/stop packet for 10 sleep wakes
 
 If level does not rise for too long:
   set no-progress warning/fault flag
@@ -210,16 +242,84 @@ If level does not reach full for too long:
   set fill-timeout fault flag
 ```
 
-Avoid learned fill-time logic in the first real version. It is more complex because fill time changes with user water usage, pump pressure, voltage, and starting level.
+Filling must not keep TX transmitting every 8 seconds forever. If the tank stays at level 1/2/3 too long while filling, both TX and RX should stop treating it as active filling.
 
-First version should use fixed conservative limits:
+Recommended first implementation:
 
 ```text
-No level rise for a fixed conservative time while filling: warning/fault candidate
-Not full after 45-60 minutes while filling: fault
+TX starts fill timer when level 1 starts motor.
+TX sends filling packets every 8 seconds while fill timer is valid.
+RX starts its own fill timer when it turns relay ON from an automatic fill command.
+
+If level reaches 4:
+  TX clears filling state
+  RX turns relay OFF
+  fill was successful
+
+If fill timeout expires before level 4:
+  TX stops frequent 8 second filling packets
+  TX sends a fill-timeout/fault packet a few times
+  RX turns relay OFF
+  RX clears active filling state
 ```
 
-Learned fill-time can be added later after real-world data, but the current direction is to avoid EEPROM. EEPROM adds code size and wear-management complexity. For now, use RAM-only timers and conservative fixed limits.
+Timeout should be conservative. Do not use the exact learned average as the cutoff, because users may be using water while the tank is filling.
+
+Suggested formula if learned fill time is used in RAM:
+
+```text
+DEFAULT_FILL_TIMEOUT = 30 minutes
+MIN_FILL_TIMEOUT = 15 minutes
+MAX_FILL_TIMEOUT = 60 minutes
+LEARN_FACTOR = 2
+
+If no learned fill time exists:
+  allowed_fill_time = DEFAULT_FILL_TIMEOUT
+
+If learned fill time exists:
+  allowed_fill_time = learned_fill_time * LEARN_FACTOR
+
+allowed_fill_time = max(15 minutes, learned_fill_time * 2)
+allowed_fill_time = min(allowed_fill_time, 60 minutes)
+```
+
+Example:
+
+```text
+If normal learned fill time is 5 minutes:
+  allowed timeout = 15 minutes
+
+If learned fill time is 20 minutes:
+  allowed timeout = 40 minutes
+```
+
+Meaning of the limits:
+
+```text
+DEFAULT_FILL_TIMEOUT:
+  used before any successful fill has been learned
+
+MIN_FILL_TIMEOUT:
+  protects against the timeout becoming too strict after fast fills
+
+MAX_FILL_TIMEOUT:
+  hard upper safety limit so the motor cannot run too long
+```
+
+Example with a pump that normally fills the tank in 5 minutes:
+
+```text
+After many successful cycles, learned_fill_time is about 5 minutes.
+Raw calculated timeout = 5 minutes * 2 = 10 minutes.
+MIN_FILL_TIMEOUT raises this to 15 minutes.
+Actual allowed timeout remains 15 minutes, even after 100 cycles.
+```
+
+Manual filling does not update learned fill time.
+
+If timeout happens because many taps are open or pump/source is weak, the motor turns OFF and TX stops frequent sending. The system can recover later when the level changes or when level 1 is reached again and a new filling attempt starts.
+
+Learned fill-time can be added later after real-world data, but the current direction is to avoid EEPROM. EEPROM adds code size and wear-management complexity. For now, use RAM-only learned values or fixed conservative limits.
 
 ## TX Manual Control
 
@@ -245,7 +345,7 @@ From AUTO:
   button must be held for 5 seconds
   if confirmed, TX enters MANUAL_SLEEP mode
   all automatic tank logic stops
-  watchdog is disabled
+  timed wake is disabled
   probe drive is OFF
   sense/ADC is OFF
   only button interrupt remains active
@@ -257,7 +357,7 @@ First-power activation:
 On fresh TX power-up:
   quickly configure the button interrupt
   keep probe drive OFF
-  keep watchdog OFF
+  keep timed wake OFF
   enter deep sleep
 
 Button held for 10 seconds:
@@ -272,13 +372,13 @@ Manual-only operation:
 
 ```text
 In MANUAL_SLEEP:
-  MCU sleeps with no watchdog wake
+  MCU sleeps with no timed wake
   button press wakes MCU
   TX sends MANUAL_TOGGLE
   TX starts 8 second wake cycle
 
 In MANUAL_ON:
-  watchdog is enabled for 8 second wake cycle
+  timed wake is enabled for 8 second wake cycle
   TX sends MANUAL_KEEPALIVE every 8 seconds while RX motor should remain ON
   probe drive/sense stay OFF
   automatic level checks stay disabled
@@ -292,7 +392,7 @@ Manual-only exit back to AUTO:
 ```text
 Button held for 5 seconds again:
   exit manual-only mode
-  re-enable normal watchdog wake
+  re-enable normal 8-second sleep wake
   re-enable normal probe reading
   treat next measured level as fresh startup level
 ```
@@ -314,7 +414,7 @@ If manual ON timer reaches 10 minutes:
   clear manual ON state
 ```
 
-In manual mode, the only safety is RX-side 10 minute maximum runtime. TX does not read probes and does not enforce dry/overflow/fill logic. `MANUAL_SLEEP` has watchdog OFF. `MANUAL_ON` has watchdog ON so it can send the 8 second keepalive. If the user needs more runtime, they can press the button again to send another manual toggle and start another 10 minute window.
+In manual mode, the only safety is RX-side 10 minute maximum runtime. TX does not read probes and does not enforce dry/overflow/fill logic. `MANUAL_SLEEP` has timed wake OFF. `MANUAL_ON` has timed wake ON so it can send the 8 second keepalive. If the user needs more runtime, they can press the button again to send another manual toggle and start another 10 minute window.
 
 Button edge/hold rule:
 
@@ -447,11 +547,12 @@ LED 6 is now part of the water level bar. Warning patterns must therefore use bl
 
 Need to decide later:
 
-- Exact TX watchdog wake interval.
+- Exact TX timed wake implementation details.
 - Exact dry retry interval. Current idea: one retry every 20 minutes while still dry.
 - Exact filling/error repeated send duration beyond dry/overflow.
 - Exact RF lost timeout on RX while filling.
 - Whether RX should keep its own motor max-run timer or trust TX fault flags.
+- Exact automatic fill timeout formula. Current idea: `max(15 minutes, learned_fill_time * 2)`, capped at 60 minutes.
 - Exact low-battery and critical-battery thresholds.
 - Whether motor fault clears only by RX power-cycle or also by a specific level pattern.
 - Whether learned fill-time should be added after field testing. Current direction: avoid EEPROM and use fixed conservative limits first.
@@ -466,7 +567,7 @@ Need to decide later:
 Next firmware direction:
 
 1. Keep the proven RF protocol unchanged.
-2. Move long fill/fault timers to TX using watchdog tick counters.
+2. Move long fill/fault timers to TX using 8-second sleep-wake counters.
 3. Reduce TX RF transmissions when the level is stable.
 4. Keep RX relay logic small and simple.
 5. Finalize LED warning patterns before adding more code.

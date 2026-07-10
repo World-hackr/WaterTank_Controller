@@ -1,15 +1,14 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
-#include <avr/eeprom.h>
 #include <util/atomic.h>
 #include <util/delay.h>
 
-#define RX_DATA   PIN_PA1 // Pin 4 (Shared RF input and pairing button)
-#define RELAY_PIN PIN_PA2 // Pin 5
-#define LINE_A    PIN_PA6 // Pin 2
-#define LINE_B    PIN_PA7 // Pin 3
-#define LINE_C    PIN_PA3 // Pin 7
+#define RX_DATA   PIN_PA1
+#define RELAY_PIN PIN_PA2
+#define LINE_A    PIN_PA6
+#define LINE_B    PIN_PA7
+#define LINE_C    PIN_PA3
 
 #define SAMPLE_RATE_HZ 8000UL
 #define RAMP_LEN 160
@@ -23,7 +22,6 @@
 // Protocol constants
 #define MSG_AUTO_REPORT 0x01
 #define MSG_MANUAL_CMD  0x02
-#define MSG_PAIRING     0x03
 
 // Flags
 #define FLAG_LEVEL_CHANGED 0x01
@@ -40,13 +38,9 @@
 #define RX_FILL_TIMEOUT_MIN_MS     900000UL  // 15 minutes
 #define RX_FILL_TIMEOUT_MAX_MS     3600000UL // 60 minutes
 #define MANUAL_MAX_RUNTIME_MS      600000UL  // 10 minutes
-#define FILL_KEEP_TIMEOUT_MS       24000UL   // 3 missed packets (24 seconds)
+#define FILL_KEEP_TIMEOUT_MS       24000UL   // 3 missed packets (3 * 8s)
 
-// EEPROM addresses
-#define EE_ID_ADDR 0x00 // 3 bytes for paired Transmitter ID
-
-// XTEA 128-bit Key
-static const uint32_t XTEA_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
+static const uint64_t AUTH_KEY = 0x7b3a91d04c8e25f1ULL;
 
 static const uint8_t symbols[16] = {
   0x0d, 0x0e, 0x13, 0x15, 0x16, 0x19, 0x1a, 0x1c,
@@ -64,15 +58,11 @@ uint8_t batteryCode = 0;
 uint8_t packetFlags = 0;
 uint8_t messageType = 0;
 
-// Pairing ID
-uint8_t pairedId[3] = {0xFF, 0xFF, 0xFF};
-
 // State flags
 bool autoRelayOn = false;
 bool manualRelayOn = false;
 bool systemFault = false;
 bool havePacket = false;
-bool inPairingMode = false;
 
 // Timers
 uint32_t lastGoodPacketMs = 0;
@@ -80,26 +70,51 @@ uint32_t fillStartTimeMs = 0;
 uint32_t manualStartTimeMs = 0;
 uint32_t allowedFillTimeMs = RX_FILL_TIMEOUT_DEFAULT_MS;
 uint32_t learnedFillTimeMs = 0;
-uint32_t pairingStartMs = 0;
-
-// Dual-Purpose Button tracker
-uint32_t buttonLowStartMs = 0;
-bool buttonHeldActive = false;
 
 static void set_clock_full_speed() {
   CPU_CCP = CCP_IOREG_gc;
   CLKCTRL.MCLKCTRLB = 0x00;
 }
 
-static void xtea_decrypt(uint32_t num_rounds, uint32_t v[2], uint32_t const k[4]) {
-  uint32_t i;
-  uint32_t v0 = v[0], v1 = v[1], delta = 0x9E3779B9, sum = delta * num_rounds;
-  for (i = 0; i < num_rounds; i++) {
-    v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + k[(sum >> 11) & 3]);
-    sum -= delta;
-    v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + k[sum & 3]);
+static uint64_t rotl64(uint64_t value, uint8_t shift) {
+  return (value << shift) | (value >> (64 - shift));
+}
+
+static uint64_t read64le(const uint8_t *p) {
+  uint64_t value = 0;
+  for (uint8_t i = 0; i < 8; i++) value |= ((uint64_t)p[i]) << (8 * i);
+  return value;
+}
+
+static void sip_round(uint64_t &v0, uint64_t &v1, uint64_t &v2, uint64_t &v3) {
+  v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+  v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+  v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+  v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+}
+
+static uint64_t auth64_tag(const uint8_t *message, uint8_t length, uint64_t key) {
+  uint64_t k0 = key;
+  uint64_t k1 = rotl64(key ^ 0xa5a5a5a55a5a5a5aULL, 17);
+  uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+  uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+  uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+  uint64_t v3 = 0x7465646279746573ULL ^ k1;
+
+  uint8_t offset = 0;
+  while ((length - offset) >= 8) {
+    uint64_t m = read64le(message + offset);
+    v3 ^= m; sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3); v0 ^= m;
+    offset += 8;
   }
-  v[0] = v0; v[1] = v1;
+
+  uint64_t b = ((uint64_t)length) << 56;
+  for (uint8_t i = 0; i < (length - offset); i++) b |= ((uint64_t)message[offset + i]) << (8 * i);
+  v3 ^= b; sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3); v0 ^= b;
+  v2 ^= 0xff;
+  sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3);
+  sip_round(v0, v1, v2, v3); sip_round(v0, v1, v2, v3);
+  return v0 ^ v1 ^ v2 ^ v3;
 }
 
 static uint16_t crc16_update(uint16_t crc, uint8_t data) {
@@ -217,41 +232,31 @@ static bool radio_recv(uint8_t *payload, uint8_t *len) {
   return true;
 }
 
+static bool verify_payload(const uint8_t *payload, uint8_t len) {
+  if (len != 13) return false;
+  return auth64_tag(payload, 5, AUTH_KEY) == read64le(payload + 5);
+}
+
 static void update_relay() {
-  if (systemFault || inPairingMode) {
-    PORTA.OUTCLR = PIN2_bm;
+  if (systemFault) {
+    PORTA.OUTCLR = PIN2_bm; // Relay OFF on fault
     return;
   }
 
-  if (manualRelayOn || autoRelayOn) {
+  if (manualRelayOn) {
+    PORTA.OUTSET = PIN2_bm;
+  } else if (autoRelayOn) {
     PORTA.OUTSET = PIN2_bm;
   } else {
     PORTA.OUTCLR = PIN2_bm;
   }
 }
 
-static void trigger_pairing_confirmation_blinks() {
-  for (uint8_t i = 0; i < 3; i++) {
-    for (uint8_t led = 1; led <= 6; led++) drive_led(led);
-    _delay_ms(150);
-    leds_off();
-    _delay_ms(150);
-  }
-}
-
 static void update_display() {
   uint32_t now = millis();
 
-  // Pairing Mode circular animation
-  if (inPairingMode) {
-    uint8_t led = 1 + ((now / 150) % 6);
-    drive_led(led);
-    _delay_ms(15);
-    return;
-  }
-
+  // If locked out due to system fault: flash LED 6 rapidly, rest OFF
   if (systemFault) {
-    // Flash LED 6 only
     bool blinkState = (now / 150) % 2 == 0;
     if (blinkState) drive_led(6);
     else leds_off();
@@ -259,16 +264,18 @@ static void update_display() {
     return;
   }
 
+  // RF Connection Lost Alert
   bool filling = autoRelayOn || manualRelayOn;
   if (filling && (now - lastGoodPacketMs > FILL_KEEP_TIMEOUT_MS)) {
-    // Link Lost mid-filling -> turn OFF pump and clear display
+    // Missing 3 keepalive packets -> Switch display off and shut off pump
     autoRelayOn = false;
     manualRelayOn = false;
+    systemFault = true; // Enter lockout
     leds_off();
     return;
   }
 
-  // Low battery background overlay blink
+  // Determine low-battery overlay flash
   bool batteryWarning = (packetFlags & FLAG_LOW_BATTERY) != 0;
   bool batteryBlinkOn = true;
   if (batteryWarning) {
@@ -281,17 +288,18 @@ static void update_display() {
     return;
   }
 
+  // Level display bar
   uint8_t level = currentLevel > 5 ? 5 : currentLevel;
 
   if (level == 0) {
-    // LED 1 blinks slowly
+    // Level 0: LED 1 blinks slowly
     bool dryBlinkOn = (now / 800) % 2 == 0;
     if (dryBlinkOn) drive_led(1);
     else leds_off();
     _delay_ms(15);
   } else if (level == 5) {
-    // LED 1-5 solid, LED 6 blinks out-of-phase
-    bool overflowBlinkOn = (now / 800) % 2 == 1;
+    // Level 5: full bar, LED 6 blinks opposite of LED 1
+    bool overflowBlinkOn = (now / 800) % 2 == 1; // Opposite phase
     for (uint8_t led = 1; led <= 6; led++) {
       if (led == 6) {
         if (overflowBlinkOn) drive_led(6);
@@ -303,7 +311,7 @@ static void update_display() {
     }
     leds_off();
   } else {
-    // Normal solid levels
+    // Level 1-4: Normal solid bar
     for (uint8_t led = 1; led <= 5; led++) {
       if (led <= level) drive_led(led);
       else leds_off();
@@ -323,156 +331,91 @@ void setup() {
   leds_off();
   pinMode(RX_DATA, INPUT);
   
-  // Read Paired ID from EEPROM
-  pairedId[0] = eeprom_read_byte((const uint8_t*)(EE_ID_ADDR + 0));
-  pairedId[1] = eeprom_read_byte((const uint8_t*)(EE_ID_ADDR + 1));
-  pairedId[2] = eeprom_read_byte((const uint8_t*)(EE_ID_ADDR + 2));
-
-  // If EEPROM empty, enter pairing mode immediately
-  if (pairedId[0] == 0xFF && pairedId[1] == 0xFF && pairedId[2] == 0xFF) {
-    inPairingMode = true;
-    pairingStartMs = millis();
-  }
-
   timer_setup();
   sei();
 }
 
 void loop() {
-  uint32_t now = millis();
+  wdt_reset();
+  uint8_t payload[13];
+  uint8_t len = sizeof(payload);
 
-  // 1. Check for Manual Pairing Button Press on RX_DATA line (PA1)
-  // Pin must be pulled LOW cleanly. An RF signal will toggle, never stay flat.
-  if (digitalRead(RX_DATA) == LOW) {
-    if (buttonLowStartMs == 0) {
-      buttonLowStartMs = now;
-    } else if ((now - buttonLowStartMs > 3000UL) && !buttonHeldActive) {
-      buttonHeldActive = true;
-      // Clear EEPROM Pairing
-      eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 0), 0xFF);
-      eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 1), 0xFF);
-      eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 2), 0xFF);
-      pairedId[0] = 0xFF; pairedId[1] = 0xFF; pairedId[2] = 0xFF;
+  if (radio_recv(payload, &len) && verify_payload(payload, len)) {
+    havePacket = true;
+    lastGoodPacketMs = millis();
+    messageType = payload[0];
+    uint8_t seq = payload[1];
+    currentLevel = payload[2];
+    batteryCode = payload[3];
+    packetFlags = payload[4];
 
-      // Trigger visual indicator and enter Pairing Mode
-      leds_off();
-      _delay_ms(200);
-      inPairingMode = true;
-      pairingStartMs = now;
-    }
-  } else {
-    buttonLowStartMs = 0;
-    buttonHeldActive = false;
-  }
-
-  // Handle Pairing Window timeout
-  if (inPairingMode && (now - pairingStartMs > 5000UL)) {
-    // If we had a previous valid ID, restore and exit pairing mode
-    if (pairedId[0] != 0xFF || pairedId[1] != 0xFF || pairedId[2] != 0xFF) {
-      inPairingMode = false;
-    }
-  }
-
-  // 2. Receive and process radio packets
-  uint8_t ciphertext[8];
-  uint8_t len = sizeof(ciphertext);
-
-  if (radio_recv(ciphertext, &len)) {
-    if (len == 8) {
-      // Decrypt the XTEA block in-place
-      xtea_decrypt(32, (uint32_t*)ciphertext, XTEA_KEY);
-      
-      uint8_t msgType = ciphertext[0];
-      uint8_t seq = ciphertext[1];
-      uint8_t level = ciphertext[2];
-      uint8_t battery = ciphertext[3];
-      uint8_t flags = ciphertext[4];
-      uint8_t rxId[3] = {ciphertext[5], ciphertext[6], ciphertext[7]};
-
-      if (inPairingMode) {
-        // Pairing Mode packet detection
-        if (msgType == MSG_PAIRING) {
-          // Write new ID to EEPROM
-          eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 0), rxId[0]);
-          eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 1), rxId[1]);
-          eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 2), rxId[2]);
-          pairedId[0] = rxId[0]; pairedId[1] = rxId[1]; pairedId[2] = rxId[2];
-          
-          inPairingMode = false;
-          trigger_pairing_confirmation_blinks();
+    // Process Message
+    if (messageType == MSG_MANUAL_CMD) {
+      if (packetFlags & FLAG_MANUAL_TOGGLE) {
+        manualRelayOn = !manualRelayOn;
+        autoRelayOn = false; // Override AUTO
+        if (manualRelayOn) {
+          manualStartTimeMs = millis();
         }
-      } else {
-        // Normal Operation: verify transmitter ID and sequence
-        if (rxId[0] == pairedId[0] && rxId[1] == pairedId[1] && rxId[2] == pairedId[2]) {
-          
-          // Replay check
-          uint8_t diff = seq - lastSequence;
-          if (havePacket && diff >= 128 && seq != lastSequence) {
-            // Out of order packet, reject
-          } else {
-            // Accept packet
-            havePacket = true;
-            lastSequence = seq;
-            lastGoodPacketMs = now;
-            currentLevel = level > 5 ? 5 : level;
-            packetFlags = flags;
-
-            // Process Commands
-            if (msgType == MSG_MANUAL_CMD) {
-              if (flags & FLAG_MANUAL_TOGGLE) {
-                manualRelayOn = !manualRelayOn;
-                autoRelayOn = false;
-                if (manualRelayOn) manualStartTimeMs = now;
-              } else if (flags & FLAG_MANUAL_KEEP) {
-                if (manualRelayOn) {
-                  // Keepalive confirm, do NOT extend 10-minute timer limit
-                }
-              }
-            } else if (msgType == MSG_AUTO_REPORT) {
-              if (!manualRelayOn) {
-                if (currentLevel >= 5 || (flags & FLAG_OVERFLOW_WARNING)) {
-                  autoRelayOn = false;
-                } else if (currentLevel <= 1 && !systemFault) {
-                  if (!autoRelayOn) {
-                    autoRelayOn = true;
-                    fillStartTimeMs = now;
-                  }
-                } else if (currentLevel >= 4) {
-                  if (autoRelayOn) {
-                    autoRelayOn = false;
-                    uint32_t duration = now - fillStartTimeMs;
-                    if (learnedFillTimeMs == 0) {
-                      learnedFillTimeMs = duration;
-                    } else {
-                      learnedFillTimeMs = (learnedFillTimeMs * 3 + duration) / 4;
-                    }
-                    allowedFillTimeMs = learnedFillTimeMs * 2;
-                    if (allowedFillTimeMs < RX_FILL_TIMEOUT_MIN_MS) allowedFillTimeMs = RX_FILL_TIMEOUT_MIN_MS;
-                    if (allowedFillTimeMs > RX_FILL_TIMEOUT_MAX_MS) allowedFillTimeMs = RX_FILL_TIMEOUT_MAX_MS;
-                  }
-                }
-
-                if (flags & FLAG_FILL_TIMEOUT) {
-                  autoRelayOn = false;
-                  systemFault = true;
-                }
-              }
-            }
+      } else if (packetFlags & FLAG_MANUAL_KEEP) {
+        if (manualRelayOn) {
+          manualStartTimeMs = millis(); // Refresh manual keepalive
+        }
+      }
+    } else if (messageType == MSG_AUTO_REPORT) {
+      // Normal AUTO water level operations
+      if (!manualRelayOn) { // Ignore level check in manual mode
+        
+        // Critical Level 5 Overflow check
+        if (currentLevel >= 5 || (packetFlags & FLAG_OVERFLOW_WARNING)) {
+          autoRelayOn = false;
+        } 
+        // Level 1: Normal Low Water Start
+        else if (currentLevel <= 1 && !systemFault) {
+          if (!autoRelayOn) {
+            autoRelayOn = true;
+            fillStartTimeMs = millis();
           }
+        }
+        // Level 4: Normal Full Water Stop
+        else if (currentLevel >= 4) {
+          if (autoRelayOn) {
+            autoRelayOn = false;
+            // Record successful fill to calculate moving average
+            uint32_t duration = millis() - fillStartTimeMs;
+            if (learnedFillTimeMs == 0) {
+              learnedFillTimeMs = duration;
+            } else {
+              learnedFillTimeMs = (learnedFillTimeMs * 3 + duration) / 4;
+            }
+            // Re-evaluate allowed fill time (1.5x learned time, clamp between 15-60m)
+            allowedFillTimeMs = learnedFillTimeMs * 2;
+            if (allowedFillTimeMs < RX_FILL_TIMEOUT_MIN_MS) allowedFillTimeMs = RX_FILL_TIMEOUT_MIN_MS;
+            if (allowedFillTimeMs > RX_FILL_TIMEOUT_MAX_MS) allowedFillTimeMs = RX_FILL_TIMEOUT_MAX_MS;
+          }
+        }
+        
+        // Check for fill timeout flag sent by TX
+        if (packetFlags & FLAG_FILL_TIMEOUT) {
+          autoRelayOn = false;
+          systemFault = true; // Lockout
         }
       }
     }
   }
 
-  // 3. Safety timers
+  uint32_t now = millis();
+
+  // Enforce RX-side Auto Fill Safety Timer
   if (autoRelayOn && (now - fillStartTimeMs > allowedFillTimeMs)) {
     autoRelayOn = false;
-    systemFault = true;
+    systemFault = true; // Lockout
   }
 
+  // Enforce RX-side Manual Max-Runtime Safety Timer
   if (manualRelayOn && (now - manualStartTimeMs > MANUAL_MAX_RUNTIME_MS)) {
     manualRelayOn = false;
-    // Enter fault on manual timer overrun
+    // Enter fault lockout on manual timer overrun
     systemFault = true;
   }
 
