@@ -493,6 +493,11 @@ void loop() {
     systemFault = true;
   }
 
+  // Reset packet history if link is offline for more than 60 seconds (allows remote reboot resync)
+  if (havePacket && (now - lastGoodPacketMs > 60000UL)) {
+    havePacket = false;
+  }
+
   update_relay();
   update_display();
 }

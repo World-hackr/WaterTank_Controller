@@ -296,7 +296,13 @@ static bool check_button_held(uint16_t ms) {
   while (digitalRead(BTN_PIN) == LOW) {
     _delay_ms(10);
     elapsed += 10;
-    if (elapsed >= ms) return true;
+    if (elapsed >= ms) {
+      // Wait for user to release the button before returning
+      while (digitalRead(BTN_PIN) == LOW) {
+        _delay_ms(10);
+      }
+      return true;
+    }
   }
   return false;
 }
