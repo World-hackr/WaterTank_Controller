@@ -38,7 +38,6 @@ static void xtea_decrypt(uint32_t num_rounds, uint32_t v[2], uint32_t const k[4]
 static void print_key(const char* label, const uint32_t k[4]) {
   Serial.print(label);
   for (uint8_t i = 0; i < 4; i++) {
-    // Print in 8-digit hex format
     for (uint8_t shift = 28; shift <= 28; shift -= 4) {
       uint8_t digit = (k[i] >> shift) & 0x0F;
       Serial.print(digit, HEX);
@@ -64,12 +63,15 @@ void setup() {
   set_clock_full_speed();
 
   Serial.swap(1);
-  Serial.begin(57600); // 115200 real-world baud at 20MHz clock
+  // Set to 4800. Under 20MHz clock (with 10MHz compile settings), 
+  // this generates exactly 9600 baud for your Serial Monitor.
+  Serial.begin(4800); 
   
   delay(1000);
   Serial.println();
   Serial.println("================================================");
   Serial.println("      ATtiny402 Cryptographic Pipeline Test      ");
+  Serial.println("      Running at: 9600 Baud                     ");
   Serial.println("================================================");
 
   // 1. Show the Master Key
@@ -102,7 +104,6 @@ void setup() {
   // 4. Simulate pairing handshake (using Master Key)
   Serial.println("4. Simulating Pairing Handshake:");
   uint8_t pairPacket[8];
-  // Fill payload with first 8 bytes of Silicon ID
   for (uint8_t i = 0; i < 8; i++) pairPacket[i] = sn[i];
 
   Serial.print("   Original Pairing Plaintext:  ");

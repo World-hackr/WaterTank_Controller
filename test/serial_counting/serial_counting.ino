@@ -12,12 +12,12 @@ void setup() {
   // Swap Serial pins to alternate mapping (TX: PA1/Pin 4)
   Serial.swap(1);
   
-  // Initialize at 57600 baud. At 20MHz clock (with 10MHz compile settings), 
-  // this will output at exactly 115200 baud on Pin 4 (PA1).
-  Serial.begin(57600);
+  // Initialize at 4800 baud. At 20MHz clock (with 10MHz compile settings), 
+  // this will output at exactly 9600 baud on Pin 4 (PA1).
+  Serial.begin(4800);
   
   _delay_ms(1000);
-  Serial.println("=== Serial Counting Test Booted ===");
+  Serial.println("=== Serial Counting Test Booted (9600 Baud) ===");
 }
 
 uint32_t count = 0;

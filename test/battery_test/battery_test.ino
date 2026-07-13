@@ -11,10 +11,10 @@ void setup() {
 
   // Swap Serial pins to alternate mapping (TX: PA1/Pin 4)
   Serial.swap(1);
-  Serial.begin(57600); // 115200 real-world baud at 20MHz clock
+  Serial.begin(4800); // 9600 real-world baud at 20MHz clock
   
   _delay_ms(1000);
-  Serial.println("=== Battery Voltage Test Booted ===");
+  Serial.println("=== Battery Voltage Test Booted (9600 Baud) ===");
 }
 
 void loop() {

@@ -84,7 +84,7 @@ uint32_t fillStartTimeMs = 0;
 uint32_t manualStartTimeMs = 0;
 uint32_t allowedFillTimeMs = RX_FILL_TIMEOUT_DEFAULT_MS;
 uint32_t learnedFillTimeMs = 0;
-uint32_t pairingStartMs = 0;
+
 
 // Dual-Purpose Button tracker
 uint32_t buttonLowStartMs = 0;
@@ -335,7 +335,6 @@ void setup() {
   // If EEPROM empty, enter pairing mode immediately
   if (pairedId[0] == 0xFF && pairedId[1] == 0xFF && pairedId[2] == 0xFF) {
     inPairingMode = true;
-    pairingStartMs = millis();
     // Use factory Master Key for pairing
     for (uint8_t i = 0; i < 4; i++) activeKey[i] = MASTER_KEY[i];
   } else {
@@ -369,21 +368,13 @@ void loop() {
       leds_off();
       _delay_ms(200);
       inPairingMode = true;
-      pairingStartMs = now;
     }
   } else {
     buttonLowStartMs = 0;
     buttonHeldActive = false;
   }
 
-  // Handle Pairing Window timeout
-  if (inPairingMode && (now - pairingStartMs > 5000UL)) {
-    // If we had a previous valid ID, restore it, reload its key, and exit pairing
-    if (pairedId[0] != 0xFF || pairedId[1] != 0xFF || pairedId[2] != 0xFF) {
-      inPairingMode = false;
-      eeprom_read_block((void*)activeKey, (const void*)EE_KEY_ADDR, 16);
-    }
-  }
+
 
   // 2. Receive and process radio packets
   uint8_t ciphertext[8];
