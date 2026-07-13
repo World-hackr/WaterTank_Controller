@@ -2,21 +2,19 @@
 #include <avr/wdt.h>
 #include <util/delay.h>
 
-#define TEST_PIN PIN_PA1 // Pin 4
-
 void setup() {
-  wdt_disable(); // Disable watchdog timer immediately on boot
+  wdt_disable(); // Disable watchdog immediately to prevent resets
 
-  // Set clock to full speed (disable bootloader division)
-  CPU_CCP = CCP_IOREG_gc;
-  CLKCTRL.MCLKCTRLB = 0x00;
-
-  pinMode(TEST_PIN, OUTPUT);
+  // Initialize hardware serial at 115200 baud on Pin 4 (PA1)
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("=== Serial Counting Test Booted ===");
 }
 
+uint32_t count = 0;
+
 void loop() {
-  digitalWrite(TEST_PIN, HIGH);
-  _delay_ms(500); // 500ms ON
-  digitalWrite(TEST_PIN, LOW);
-  _delay_ms(500); // 500ms OFF
+  Serial.print("Count: ");
+  Serial.println(count++);
+  delay(1000); // Send count once per second
 }
