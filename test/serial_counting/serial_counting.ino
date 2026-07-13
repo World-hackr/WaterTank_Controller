@@ -9,6 +9,9 @@ void setup() {
   CPU_CCP = CCP_IOREG_gc;
   CLKCTRL.MCLKCTRLB = 0x00;
 
+  // Swap Serial pins to alternate mapping (TX: PA1/Pin 4, RX: PA2/Pin 5)
+  Serial.swap(1);
+  
   // Initialize at 57600 baud. At 20MHz clock (with 10MHz compile settings), 
   // this will output at exactly 115200 baud on Pin 4 (PA1).
   Serial.begin(57600);
