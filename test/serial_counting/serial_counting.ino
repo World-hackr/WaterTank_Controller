@@ -5,9 +5,15 @@
 void setup() {
   wdt_disable(); // Disable watchdog immediately to prevent resets
 
-  // Initialize hardware serial at 115200 baud on Pin 4 (PA1)
-  Serial.begin(115200);
-  delay(1000);
+  // Set clock to 20MHz (division 1) - matches working blink test
+  CPU_CCP = CCP_IOREG_gc;
+  CLKCTRL.MCLKCTRLB = 0x00;
+
+  // Initialize at 57600 baud. At 20MHz clock (with 10MHz compile settings), 
+  // this will output at exactly 115200 baud on Pin 4 (PA1).
+  Serial.begin(57600);
+  
+  _delay_ms(1000);
   Serial.println("=== Serial Counting Test Booted ===");
 }
 
@@ -16,5 +22,5 @@ uint32_t count = 0;
 void loop() {
   Serial.print("Count: ");
   Serial.println(count++);
-  delay(1000); // Send count once per second
+  _delay_ms(1000); // Wait 1 second (uses accurate utility delay)
 }
