@@ -43,10 +43,11 @@
 #define FILL_KEEP_TIMEOUT_MS       24000UL   // 3 missed packets (24 seconds)
 
 // EEPROM addresses
-#define EE_ID_ADDR 0x00 // 3 bytes for paired Transmitter ID
+#define EE_ID_ADDR  0x00 // 3 bytes for paired Transmitter ID (0x00 - 0x02)
+#define EE_KEY_ADDR 0x03 // 16 bytes for derived Unique Key (0x03 - 0x12)
 
-// XTEA 128-bit Key
-static const uint32_t XTEA_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
+// XTEA 128-bit Master Key (used only during pairing)
+static const uint32_t MASTER_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
 
 static const uint8_t symbols[16] = {
   0x0d, 0x0e, 0x13, 0x15, 0x16, 0x19, 0x1a, 0x1c,
@@ -66,6 +67,9 @@ uint8_t messageType = 0;
 
 // Pairing ID
 uint8_t pairedId[3] = {0xFF, 0xFF, 0xFF};
+
+// Active XTEA Key (loaded from EEPROM or Master Key)
+uint32_t activeKey[4];
 
 // State flags
 bool autoRelayOn = false;
@@ -332,6 +336,11 @@ void setup() {
   if (pairedId[0] == 0xFF && pairedId[1] == 0xFF && pairedId[2] == 0xFF) {
     inPairingMode = true;
     pairingStartMs = millis();
+    // Use factory Master Key for pairing
+    for (uint8_t i = 0; i < 4; i++) activeKey[i] = MASTER_KEY[i];
+  } else {
+    // Load derived Unique Key from EEPROM for normal operation
+    eeprom_read_block((void*)activeKey, (const void*)EE_KEY_ADDR, 16);
   }
 
   timer_setup();
@@ -342,17 +351,19 @@ void loop() {
   uint32_t now = millis();
 
   // 1. Check for Manual Pairing Button Press on RX_DATA line (PA1)
-  // Pin must be pulled LOW cleanly. An RF signal will toggle, never stay flat.
   if (digitalRead(RX_DATA) == LOW) {
     if (buttonLowStartMs == 0) {
       buttonLowStartMs = now;
     } else if ((now - buttonLowStartMs > 3000UL) && !buttonHeldActive) {
       buttonHeldActive = true;
-      // Clear EEPROM Pairing
+      // Clear EEPROM Pairing ID
       eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 0), 0xFF);
       eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 1), 0xFF);
       eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 2), 0xFF);
       pairedId[0] = 0xFF; pairedId[1] = 0xFF; pairedId[2] = 0xFF;
+
+      // Force active key to factory Master Key
+      for (uint8_t i = 0; i < 4; i++) activeKey[i] = MASTER_KEY[i];
 
       // Trigger visual indicator and enter Pairing Mode
       leds_off();
@@ -367,9 +378,10 @@ void loop() {
 
   // Handle Pairing Window timeout
   if (inPairingMode && (now - pairingStartMs > 5000UL)) {
-    // If we had a previous valid ID, restore and exit pairing mode
+    // If we had a previous valid ID, restore it, reload its key, and exit pairing
     if (pairedId[0] != 0xFF || pairedId[1] != 0xFF || pairedId[2] != 0xFF) {
       inPairingMode = false;
+      eeprom_read_block((void*)activeKey, (const void*)EE_KEY_ADDR, 16);
     }
   }
 
@@ -379,20 +391,29 @@ void loop() {
 
   if (radio_recv(ciphertext, &len)) {
     if (len == 8) {
-      // Decrypt the XTEA block in-place
-      xtea_decrypt(32, (uint32_t*)ciphertext, XTEA_KEY);
+      // Decrypt the XTEA block in-place using current activeKey
+      xtea_decrypt(32, (uint32_t*)ciphertext, activeKey);
       
-      uint8_t msgType = ciphertext[0];
-      uint8_t seq = ciphertext[1];
-      uint8_t level = ciphertext[2];
-      uint8_t battery = ciphertext[3];
-      uint8_t flags = ciphertext[4];
-      uint8_t rxId[3] = {ciphertext[5], ciphertext[6], ciphertext[7]};
-
       if (inPairingMode) {
-        // Pairing Mode packet detection
-        if (msgType == MSG_PAIRING) {
-          // Write new ID to EEPROM
+        // Verification of pairing package: contains 8-byte Silicon ID.
+        // We verify that the first 2 bytes match the factory signature 0x3055
+        if (ciphertext[0] == 0x30 && ciphertext[1] == 0x55) {
+          // 1. Calculate the Unique Key dynamically on the RX
+          uint32_t serial_high = ((uint32_t)ciphertext[0] << 24) | ((uint32_t)ciphertext[1] << 16) | ((uint32_t)ciphertext[2] << 8) | ciphertext[3];
+          uint32_t serial_low  = ((uint32_t)ciphertext[4] << 24) | ((uint32_t)ciphertext[5] << 16) | ((uint32_t)ciphertext[6] << 8) | ciphertext[7];
+
+          activeKey[0] = MASTER_KEY[0] ^ serial_high;
+          activeKey[1] = MASTER_KEY[1] ^ serial_low;
+          activeKey[2] = MASTER_KEY[2] ^ (serial_high ^ serial_low);
+          activeKey[3] = MASTER_KEY[3] ^ (serial_high + serial_low);
+
+          // 2. Save derived Unique Key to EEPROM
+          eeprom_write_block((const void*)activeKey, (void*)EE_KEY_ADDR, 16);
+
+          // 3. Extract the 3-byte binding ID (last 3 bytes of Silicon ID: index 5, 6, 7)
+          uint8_t rxId[3] = {ciphertext[5], ciphertext[6], ciphertext[7]};
+
+          // 4. Save Binding ID to EEPROM
           eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 0), rxId[0]);
           eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 1), rxId[1]);
           eeprom_write_byte((uint8_t*)(EE_ID_ADDR + 2), rxId[2]);
@@ -403,6 +424,12 @@ void loop() {
         }
       } else {
         // Normal Operation: verify transmitter ID and sequence
+        uint8_t msgType = ciphertext[0];
+        uint8_t seq = ciphertext[1];
+        uint8_t level = ciphertext[2];
+        uint8_t flags = ciphertext[4];
+        uint8_t rxId[3] = {ciphertext[5], ciphertext[6], ciphertext[7]};
+
         if (rxId[0] == pairedId[0] && rxId[1] == pairedId[1] && rxId[2] == pairedId[2]) {
           
           // Replay check
@@ -472,7 +499,6 @@ void loop() {
 
   if (manualRelayOn && (now - manualStartTimeMs > MANUAL_MAX_RUNTIME_MS)) {
     manualRelayOn = false;
-    // Enter fault on manual timer overrun
     systemFault = true;
   }
 

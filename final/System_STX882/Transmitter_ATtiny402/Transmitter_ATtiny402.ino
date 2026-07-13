@@ -8,7 +8,7 @@
 #define PROBE_SENSE PIN_PA6 // Pin 2
 #define PROBE_DRIVE PIN_PA7 // Pin 3
 #define TX_DATA     PIN_PA1 // Pin 4
-#define BTN_PIN     PIN_PA3 // Pin 7 (Remapped button, replaces Pin 5 PA2)
+#define BTN_PIN     PIN_PA3 // Pin 7 (Remapped button pin)
 
 #define BIT_US 1000
 #define REPEATS_PER_PACKET 4
@@ -41,10 +41,11 @@
 #define OVERFLOW_REPORT_WAKE_COUNT 10  // 80 seconds
 
 // EEPROM addresses
-#define EE_ACT_ADDR 0x00 // 0x55 if activated, 0xFF if first startup
+#define EE_ACT_ADDR  0x00 // 0x55 if activated, 0xFF if first startup
+#define EE_KEY_ADDR  0x01 // 16 bytes for derived Unique Key (0x01 - 0x10)
 
-// XTEA 128-bit Key
-static const uint32_t XTEA_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
+// XTEA 128-bit Master Key (used only during pairing)
+static const uint32_t MASTER_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
 
 // Calibrated ADC Probe levels
 #define ADC_LEVEL_1 160
@@ -64,6 +65,9 @@ uint8_t candidateLevel = 0;
 uint8_t candidateCount = 0;
 bool firstReport = true;
 
+// Active XTEA Key (loaded from EEPROM or Master Key)
+uint32_t activeKey[4];
+
 // State Tracking
 bool manualMode = false;
 bool manualOn = false;
@@ -79,11 +83,11 @@ uint16_t overflowWakeCount = 0;
 // PIT 1.024-second wake counter
 volatile uint8_t oneSecondWakes = 0;
 
-// Reads 3 bytes from the Silicon Serial Number (Signature Row) starting at 0x1103
-static void get_silicon_id(uint8_t *id) {
-  id[0] = *(volatile uint8_t*)(0x1103);
-  id[1] = *(volatile uint8_t*)(0x1104);
-  id[2] = *(volatile uint8_t*)(0x1105);
+// Reads 8 bytes from Silicon Serial Number starting at 0x1103
+static void get_silicon_id_8(uint8_t *id) {
+  for (uint8_t i = 0; i < 8; i++) {
+    id[i] = *(volatile uint8_t*)(0x1103 + i);
+  }
 }
 
 static void set_clock_full_speed() {
@@ -238,10 +242,10 @@ static uint8_t read_battery_code() {
 
   if (adc == 0) return 0;
   uint32_t vcc_mv = (1125300UL / adc);
-  return (uint8_t)(vcc_mv / 20); // 20mV scaling, e.g. 4.5V = 225
+  return (uint8_t)(vcc_mv / 20); // 20mV scaling
 }
 
-static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, uint8_t extraFlags) {
+static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, uint8_t extraFlags, const uint32_t* key) {
   uint8_t plaintext[8];
   uint8_t battery = read_battery_code();
   uint8_t flags = extraFlags;
@@ -253,10 +257,14 @@ static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, 
   plaintext[2] = level;
   plaintext[3] = battery;
   plaintext[4] = flags;
-  get_silicon_id(plaintext + 5); // Bytes 5-7 hold the unique ID
+  
+  // Bytes 5-7 contain the last 3 bytes of the Silicon ID
+  plaintext[5] = *(volatile uint8_t*)(0x110A);
+  plaintext[6] = *(volatile uint8_t*)(0x110B);
+  plaintext[7] = *(volatile uint8_t*)(0x110C);
 
-  // Encrypt the 8-byte plaintext block in-place
-  xtea_encrypt(32, (uint32_t*)plaintext, XTEA_KEY);
+  // Encrypt in-place using the specified key
+  xtea_encrypt(32, (uint32_t*)plaintext, key);
 
   for (uint8_t repeat = 0; repeat < REPEATS_PER_PACKET; repeat++) {
     radio_send(plaintext, 8);
@@ -266,21 +274,21 @@ static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, 
 }
 
 static void configure_pit_sleep() {
-  RTC.PITINTCTRL = RTC_PI_bm; // Enable Periodic Interrupt
-  RTC.PITCTRLA = RTC_PERIOD_CYC32768_gc | RTC_PITEN_bm; // ~1s period
+  RTC.PITINTCTRL = RTC_PI_bm;
+  RTC.PITCTRLA = RTC_PERIOD_CYC32768_gc | RTC_PITEN_bm; 
 }
 
 static void configure_pit_off() {
-  RTC.PITCTRLA = 0x00; // Disable PIT
+  RTC.PITCTRLA = 0x00; 
 }
 
 ISR(RTC_PIT_vect) {
-  RTC.PITINTFLAGS = RTC_PI_bm; // Clear Periodic Interrupt flag
+  RTC.PITINTFLAGS = RTC_PI_bm; 
   oneSecondWakes++;
 }
 
 ISR(PORTA_PORT_vect) {
-  PORTA.INTFLAGS = PIN3_bm; // Clear Button interrupt flag
+  PORTA.INTFLAGS = PIN3_bm; 
 }
 
 static bool check_button_held(uint16_t ms) {
@@ -291,6 +299,20 @@ static bool check_button_held(uint16_t ms) {
     if (elapsed >= ms) return true;
   }
   return false;
+}
+
+// Generates the unique key dynamically using Silicon ID + Master Key
+static void derive_unique_key(uint32_t *destKey) {
+  uint8_t sn[8];
+  get_silicon_id_8(sn);
+  
+  uint32_t serial_high = ((uint32_t)sn[0] << 24) | ((uint32_t)sn[1] << 16) | ((uint32_t)sn[2] << 8) | sn[3];
+  uint32_t serial_low  = ((uint32_t)sn[4] << 24) | ((uint32_t)sn[5] << 16) | ((uint32_t)sn[6] << 8) | sn[7];
+
+  destKey[0] = MASTER_KEY[0] ^ serial_high;
+  destKey[1] = MASTER_KEY[1] ^ serial_low;
+  destKey[2] = MASTER_KEY[2] ^ (serial_high ^ serial_low);
+  destKey[3] = MASTER_KEY[3] ^ (serial_high + serial_low);
 }
 
 void setup() {
@@ -307,18 +329,34 @@ void setup() {
   
   uint8_t activationStatus = eeprom_read_byte((const uint8_t*)EE_ACT_ADDR);
 
-  // First Startup Safety Block: waits for 10-second activation hold
+  // 1. First Boot Activation & Pairing Window
   if (activationStatus != 0x55) {
     while (true) {
       if (digitalRead(BTN_PIN) == LOW) {
         if (check_button_held(10000)) {
+          // Derive the Unique Key from Silicon ID and write it to EEPROM
+          uint32_t derivedKey[4];
+          derive_unique_key(derivedKey);
+          
+          eeprom_write_block((const void*)derivedKey, (void*)EE_KEY_ADDR, 16);
           eeprom_write_byte((uint8_t*)EE_ACT_ADDR, 0x55);
-          // Pairing command broadcast
-          encrypt_and_send(0, false, MSG_PAIRING, 0);
+          
+          // Generate pairing packet plaintext: contains the 8 bytes of Silicon ID
+          uint8_t pairPayload[8];
+          get_silicon_id_8(pairPayload);
+
+          // Encrypt pairing packet with Factory Master Key
+          xtea_encrypt(32, (uint32_t*)pairPayload, MASTER_KEY);
+          
+          // Broadcast pairing packet aggressively
+          for (uint8_t r = 0; r < 10; r++) {
+            radio_send(pairPayload, 8);
+            _delay_ms(PACKET_GAP_MS);
+          }
           break;
         }
       }
-      PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Button wake
+      PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Wake on button
       set_sleep_mode(SLEEP_MODE_PWR_DOWN);
       sei();
       sleep_mode();
@@ -326,6 +364,9 @@ void setup() {
       PORTA.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
     }
   }
+
+  // 2. Normal Boots: load the derived Unique Key from EEPROM
+  eeprom_read_block((void*)activeKey, (const void*)EE_KEY_ADDR, 16);
   
   configure_pit_sleep();
 }
@@ -351,7 +392,7 @@ void loop() {
       // Short press: Toggle MANUAL State
       if (manualMode) {
         manualOn = !manualOn;
-        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_TOGGLE);
+        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_TOGGLE, activeKey);
         
         if (manualOn) {
           configure_pit_sleep();
@@ -370,7 +411,7 @@ void loop() {
     if (manualMode) {
       if (manualOn) {
         // Send manual keepalive
-        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_KEEP);
+        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_KEEP, activeKey);
       }
     } else {
       // Normal Auto water level checks
@@ -400,7 +441,7 @@ void loop() {
         
         if (fillTimerTicks >= allowedFillTicks) {
           activeFilling = false;
-          encrypt_and_send(level, false, MSG_AUTO_REPORT, FLAG_FILL_TIMEOUT);
+          encrypt_and_send(level, false, MSG_AUTO_REPORT, FLAG_FILL_TIMEOUT, activeKey);
         }
       }
 
@@ -414,7 +455,6 @@ void loop() {
         if (level == 5) overflowWakeCount = 0;
       } else if (activeFilling) {
         shouldSend = true;
-        // The packet itself acts as the keepalive, no special flag byte is needed
       } else if (level == 0) {
         if (dryWakeCount < DRY_REPORT_WAKE_COUNT) {
           shouldSend = true;
@@ -436,7 +476,7 @@ void loop() {
       }
 
       if (shouldSend) {
-        encrypt_and_send(level, levelChanged, MSG_AUTO_REPORT, extraFlags);
+        encrypt_and_send(level, levelChanged, MSG_AUTO_REPORT, extraFlags, activeKey);
       }
     }
   }
