@@ -297,11 +297,7 @@ static bool check_button_held(uint16_t ms) {
     _delay_ms(10);
     elapsed += 10;
     if (elapsed >= ms) {
-      // Wait for user to release the button before returning
-      while (digitalRead(BTN_PIN) == LOW) {
-        _delay_ms(10);
-      }
-      return true;
+      return true; // Return true immediately when threshold is reached
     }
   }
   return false;
@@ -339,7 +335,7 @@ void setup() {
   if (activationStatus != 0x55) {
     while (true) {
       if (digitalRead(BTN_PIN) == LOW) {
-        if (check_button_held(10000)) {
+        if (check_button_held(5000)) { // 5-second pairing hold
           // Derive the Unique Key from Silicon ID and write it to EEPROM
           uint32_t derivedKey[4];
           derive_unique_key(derivedKey);
@@ -358,6 +354,11 @@ void setup() {
           for (uint8_t r = 0; r < 10; r++) {
             radio_send(pairPayload, 8);
             _delay_ms(PACKET_GAP_MS);
+          }
+
+          // Now wait for user to release the button
+          while (digitalRead(BTN_PIN) == LOW) {
+            _delay_ms(10);
           }
           break;
         }
@@ -393,7 +394,11 @@ void loop() {
       } else {
         configure_pit_sleep();
       }
-      _delay_ms(300);
+      
+      // Wait for release before returning
+      while (digitalRead(BTN_PIN) == LOW) {
+        _delay_ms(10);
+      }
     } else {
       // Short press: Toggle MANUAL State
       if (manualMode) {

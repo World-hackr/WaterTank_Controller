@@ -246,6 +246,12 @@ static void trigger_pairing_confirmation_blinks() {
 static void update_display() {
   uint32_t now = millis();
 
+  // If no packet has been received yet, keep display completely OFF
+  if (!havePacket && !inPairingMode && !systemFault) {
+    leds_off();
+    return;
+  }
+
   // Pairing Mode circular animation
   if (inPairingMode) {
     uint8_t led = 1 + ((now / 150) % 6);
