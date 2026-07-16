@@ -27,11 +27,6 @@
 #define FLAG_DRY_WARNING   0x40
 #define FLAG_OVERFLOW_WARNING 0x80
 
-// Ticks (8.2 second intervals)
-#define DRY_REPORT_WAKE_COUNT      5   // 40 seconds
-#define DRY_RETRY_WAKE_INTERVAL    150 // 20 minutes
-#define OVERFLOW_REPORT_WAKE_COUNT 10  // 80 seconds
-
 // EEPROM addresses (Memory-mapped starting at 0x1400)
 #define EEPROM_BASE  0x1400
 #define EE_ACT_ADDR  0x00 // 0x55 if activated
@@ -54,10 +49,6 @@ uint32_t activeKey[4];
 // State Tracking
 bool manualMode = false;
 bool manualOn = false;
-
-// Watchdog/PIT Counter tracking
-uint16_t dryWakeCount = 0;
-uint16_t overflowWakeCount = 0;
 
 // PIT 1.024-second wake counter
 volatile uint8_t oneSecondWakes = 0;
@@ -403,40 +394,12 @@ void loop() {
       bool levelChanged = (level != reportedLevel);
       reportedLevel = level;
 
-      // Transmit requirement decision
-      bool shouldSend = false;
-      uint8_t extraFlags = 0;
-
-      if (levelChanged) {
-        shouldSend = true;
-        if (level == 0) dryWakeCount = 0;
-        if (level == 5) overflowWakeCount = 0;
-      } else if (level < 4) {
-        // Keep sending periodically during filling (level 1 to 3) to keep link alive
-        shouldSend = true;
-      } else if (level == 0) {
-        if (dryWakeCount < DRY_REPORT_WAKE_COUNT) {
-          shouldSend = true;
-          dryWakeCount++;
-        } else {
-          dryWakeCount++;
-          if (dryWakeCount >= DRY_RETRY_WAKE_INTERVAL) {
-            shouldSend = true;
-            dryWakeCount = DRY_REPORT_WAKE_COUNT;
-          }
-        }
-        extraFlags |= FLAG_DRY_WARNING;
-      } else if (level == 5) {
-        if (overflowWakeCount < OVERFLOW_REPORT_WAKE_COUNT) {
-          shouldSend = true;
-          overflowWakeCount++;
-        }
-        extraFlags |= FLAG_OVERFLOW_WARNING;
-      }
-
-      if (shouldSend) {
-        uint8_t flags = extraFlags;
+      // Transmit on change, or on every wake if water is not full (level != 4) to keep link alive
+      if (levelChanged || level != 4) {
+        uint8_t flags = 0;
         if (levelChanged) flags |= FLAG_LEVEL_CHANGED;
+        if (level == 0) flags |= FLAG_DRY_WARNING;
+        if (level == 5) flags |= FLAG_OVERFLOW_WARNING;
         encrypt_and_send(level, MSG_AUTO_REPORT, flags);
       }
     }
