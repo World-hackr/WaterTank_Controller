@@ -2,20 +2,17 @@
 #include <avr/wdt.h>
 #include <avr/sleep.h>
 #include <avr/interrupt.h>
-#include <avr/eeprom.h>
 #include <util/delay.h>
 
-#define PROBE_SENSE PIN_PA6 // Pin 2
-#define PROBE_DRIVE PIN_PA7 // Pin 3
-#define TX_DATA     PIN_PA1 // Pin 4
-#define BTN_PIN     PIN_PA3 // Pin 7 (Remapped button pin)
+#define TX_DATA_PIN  1 // PA1 (RF Data Out)
+#define BTN_PIN      3 // PA3 (Button Input)
+#define DRIVE_PIN    2 // PA2 (Common Probe Drive)
 
 #define BIT_US 1000
 #define REPEATS_PER_PACKET 4
 #define MAX_PACKET_LEN 16
-#define ADC_SAMPLES 9
-#define STABLE_REQUIRED_READS 2
 #define PACKET_GAP_MS 35
+#define STABLE_REQUIRED_READS 2
 
 // Protocol constants
 #define MSG_AUTO_REPORT 0x01
@@ -25,7 +22,6 @@
 // Flags
 #define FLAG_LEVEL_CHANGED 0x01
 #define FLAG_LOW_BATTERY   0x02
-#define FLAG_FILL_TIMEOUT  0x04
 #define FLAG_MANUAL_MODE   0x08
 #define FLAG_MANUAL_TOGGLE 0x10
 #define FLAG_MANUAL_KEEP   0x20
@@ -33,26 +29,17 @@
 #define FLAG_OVERFLOW_WARNING 0x80
 
 // Ticks (8.2 second intervals)
-#define DEFAULT_FILL_TIMEOUT_TICKS 220 // ~30 minutes
-#define MIN_FILL_TIMEOUT_TICKS     110 // ~15 minutes
-#define MAX_FILL_TIMEOUT_TICKS     440 // ~60 minutes
 #define DRY_REPORT_WAKE_COUNT      5   // 40 seconds
 #define DRY_RETRY_WAKE_INTERVAL    150 // 20 minutes
 #define OVERFLOW_REPORT_WAKE_COUNT 10  // 80 seconds
 
-// EEPROM addresses
-#define EE_ACT_ADDR  0x00 // 0x55 if activated, 0xFF if first startup
-#define EE_KEY_ADDR  0x01 // 16 bytes for derived Unique Key (0x01 - 0x10)
+// EEPROM addresses (Memory-mapped starting at 0x1400)
+#define EEPROM_BASE  0x1400
+#define EE_ACT_ADDR  0x00 // 0x55 if activated
+#define EE_KEY_ADDR  0x01 // 16 bytes for derived Unique Key
 
 // XTEA 128-bit Master Key (used only during pairing)
 static const uint32_t MASTER_KEY[4] = {0x7b3a91d0, 0x4c8e25f1, 0x12345678, 0x9abcdef0};
-
-// Calibrated ADC Probe levels
-#define ADC_LEVEL_1 160
-#define ADC_LEVEL_2 340
-#define ADC_LEVEL_3 520
-#define ADC_LEVEL_4 700
-#define ADC_LEVEL_5 850
 
 static const uint8_t symbols[16] = {
   0x0d, 0x0e, 0x13, 0x15, 0x16, 0x19, 0x1a, 0x1c,
@@ -61,9 +48,6 @@ static const uint8_t symbols[16] = {
 
 uint8_t sequenceId = 0;
 uint8_t reportedLevel = 0;
-uint8_t candidateLevel = 0;
-uint8_t candidateCount = 0;
-bool firstReport = true;
 
 // Active XTEA Key (loaded from EEPROM or Master Key)
 uint32_t activeKey[4];
@@ -71,10 +55,6 @@ uint32_t activeKey[4];
 // State Tracking
 bool manualMode = false;
 bool manualOn = false;
-bool activeFilling = false;
-uint16_t fillTimerTicks = 0;
-uint16_t allowedFillTicks = DEFAULT_FILL_TIMEOUT_TICKS;
-uint16_t learnedFillTicks = 0;
 
 // Watchdog/PIT Counter tracking
 uint16_t dryWakeCount = 0;
@@ -95,10 +75,10 @@ static void set_clock_full_speed() {
   CLKCTRL.MCLKCTRLB = 0x00;
 }
 
-static void xtea_encrypt(uint32_t num_rounds, uint32_t v[2], uint32_t const k[4]) {
-  uint32_t i;
+// XTEA encryption optimized for 8-bit AVR (loop count hardcoded to 32, counter is uint8_t)
+static void xtea_encrypt(uint32_t v[2], uint32_t const k[4]) {
   uint32_t v0 = v[0], v1 = v[1], sum = 0, delta = 0x9E3779B9;
-  for (i = 0; i < num_rounds; i++) {
+  for (uint8_t i = 0; i < 32; i++) {
     v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + k[sum & 3]);
     sum += delta;
     v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + k[(sum >> 11) & 3]);
@@ -113,13 +93,17 @@ static uint16_t crc16_update(uint16_t crc, uint8_t data) {
 }
 
 static void tx_write(bool value) {
-  digitalWrite(TX_DATA, value ? HIGH : LOW);
+  if (value) {
+    PORTA.OUTSET = PIN1_bm;
+  } else {
+    PORTA.OUTCLR = PIN1_bm;
+  }
 }
 
 static void send_symbol(uint8_t symbol) {
   for (uint8_t bit = 0; bit < 6; bit++) {
     tx_write((symbol & (1 << bit)) != 0);
-    delayMicroseconds(BIT_US);
+    _delay_us(BIT_US);
   }
 }
 
@@ -147,83 +131,41 @@ static void radio_send(const uint8_t *payload, uint8_t len) {
   tx_write(false);
 }
 
-static uint16_t read_probe_adc() {
-  digitalWrite(PROBE_DRIVE, HIGH);
-  delayMicroseconds(80);
+// Repeated packet transmission helper to prevent duplicate loop bloat
+static void send_packet_repeats(const uint8_t *payload, uint8_t repeats) {
+  for (uint8_t r = 0; r < repeats; r++) {
+    radio_send(payload, 8);
+    _delay_ms(PACKET_GAP_MS);
+  }
+}
+
+// Reads 5 digital probe pins in order to determine water level
+static uint8_t read_digital_level() {
+  // Drive common line LOW
+  PORTA.OUTCLR = PIN2_bm;
+  PORTA.DIRSET = PIN2_bm; 
+  _delay_us(10); // Let line settle
+
+  uint8_t level = 0;
   
-  ADC0.CTRLC = ADC_REFSEL_VDDREF_gc | ADC_PRESC_DIV16_gc;
-  ADC0.MUXPOS = ADC_MUXPOS_AIN6_gc; 
-  ADC0.CTRLA = ADC_ENABLE_bm;
+  // Probes are Active LOW (pulled to GND by water)
+  if (!(PORTA.IN & PIN4_bm)) level = 1; // PA4 wet
+  if (!(PORTA.IN & PIN5_bm)) level = 2; // PA5 wet
+  if (!(PORTA.IN & PIN6_bm)) level = 3; // PA6 wet
+  if (!(PORTA.IN & PIN7_bm)) level = 4; // PA7 wet
+  if (!(PORTB.IN & PIN3_bm)) level = 5; // PB3 wet
 
-  ADC0.INTFLAGS = ADC_RESRDY_bm;
-  ADC0.COMMAND = ADC_STCONV_bm;
-  while (!(ADC0.INTFLAGS & ADC_RESRDY_bm));
+  // Turn off drive pin (pull to High-Z input to prevent corrosion)
+  PORTA.DIRCLR = PIN2_bm;
+  PORTA.OUTSET = PIN2_bm;
 
-  uint16_t adc = ADC0.RES;
-  ADC0.CTRLA = 0; 
-  digitalWrite(PROBE_DRIVE, LOW);
-  return adc;
+  return level;
 }
 
-static uint8_t classify_adc(uint16_t adc) {
-  if (adc >= ADC_LEVEL_5) return 5;
-  if (adc >= ADC_LEVEL_4) return 4;
-  if (adc >= ADC_LEVEL_3) return 3;
-  if (adc >= ADC_LEVEL_2) return 2;
-  if (adc >= ADC_LEVEL_1) return 1;
-  return 0;
-}
-
-static uint16_t median_adc() {
-  uint16_t values[ADC_SAMPLES];
-  for (uint8_t i = 0; i < ADC_SAMPLES; i++) {
-    values[i] = read_probe_adc();
-    delayMicroseconds(500);
-  }
-
-  for (uint8_t i = 1; i < ADC_SAMPLES; i++) {
-    uint16_t v = values[i];
-    int8_t j = i - 1;
-    while (j >= 0 && values[j] > v) {
-      values[j + 1] = values[j];
-      j--;
-    }
-    values[j + 1] = v;
-  }
-  return values[ADC_SAMPLES / 2];
-}
-
-static uint8_t read_filtered_level(bool *changed) {
-  uint8_t instantLevel = classify_adc(median_adc());
-
-  if (firstReport) {
-    reportedLevel = instantLevel;
-    candidateLevel = instantLevel;
-    candidateCount = STABLE_REQUIRED_READS;
-    firstReport = false;
-    *changed = true;
-    return reportedLevel;
-  }
-
-  if (instantLevel != candidateLevel) {
-    candidateLevel = instantLevel;
-    candidateCount = 1;
-  } else if (candidateCount < STABLE_REQUIRED_READS) {
-    candidateCount++;
-  }
-
-  if (candidateCount >= STABLE_REQUIRED_READS && reportedLevel != candidateLevel) {
-    reportedLevel = candidateLevel;
-    *changed = true;
-  } else {
-    *changed = false;
-  }
-  return reportedLevel;
-}
-
+// Read Vcc directly against internal reference (single conversion after settling)
 static uint8_t read_battery_code() {
   VREF.CTRLA = VREF_ADC0REFSEL_1V1_gc;
-  delayMicroseconds(500);
+  _delay_us(500); // Wait for Vref to settle fully
 
   ADC0.CTRLC = ADC_REFSEL_VDDREF_gc | ADC_PRESC_DIV16_gc;
   ADC0.MUXPOS = ADC_MUXPOS_INTREF_gc;
@@ -233,24 +175,16 @@ static uint8_t read_battery_code() {
   ADC0.COMMAND = ADC_STCONV_bm;
   while (!(ADC0.INTFLAGS & ADC_RESRDY_bm));
 
-  ADC0.INTFLAGS = ADC_RESRDY_bm;
-  ADC0.COMMAND = ADC_STCONV_bm;
-  while (!(ADC0.INTFLAGS & ADC_RESRDY_bm));
-
   uint16_t adc = ADC0.RES;
   ADC0.CTRLA = 0;
 
-  if (adc == 0) return 0;
-  uint32_t vcc_mv = (1125300UL / adc);
-  return (uint8_t)(vcc_mv / 20); // 20mV scaling
+  return (adc >= 341) ? 150 : 180;
 }
 
-static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, uint8_t extraFlags, const uint32_t* key) {
+static void encrypt_and_send(uint8_t level, uint8_t msgType, uint8_t flags) {
   uint8_t plaintext[8];
   uint8_t battery = read_battery_code();
-  uint8_t flags = extraFlags;
-  if (levelChanged) flags |= FLAG_LEVEL_CHANGED;
-  if (battery != 0 && battery < 165) flags |= FLAG_LOW_BATTERY; // <3.3V
+  if (battery == 150) flags |= FLAG_LOW_BATTERY;
 
   plaintext[0] = msgType;
   plaintext[1] = sequenceId;
@@ -263,13 +197,10 @@ static void encrypt_and_send(uint8_t level, bool levelChanged, uint8_t msgType, 
   plaintext[6] = *(volatile uint8_t*)(0x110B);
   plaintext[7] = *(volatile uint8_t*)(0x110C);
 
-  // Encrypt in-place using the specified key
-  xtea_encrypt(32, (uint32_t*)plaintext, key);
+  // Encrypt in-place using the global activeKey
+  xtea_encrypt((uint32_t*)plaintext, activeKey);
 
-  for (uint8_t repeat = 0; repeat < REPEATS_PER_PACKET; repeat++) {
-    radio_send(plaintext, 8);
-    delay(PACKET_GAP_MS);
-  }
+  send_packet_repeats(plaintext, REPEATS_PER_PACKET);
   sequenceId++;
 }
 
@@ -291,89 +222,134 @@ ISR(PORTA_PORT_vect) {
   PORTA.INTFLAGS = PIN3_bm; 
 }
 
-static bool check_button_held(uint16_t ms) {
-  uint16_t elapsed = 0;
-  while (digitalRead(BTN_PIN) == LOW) {
-    _delay_ms(10);
-    elapsed += 10;
-    if (elapsed >= ms) {
-      return true; // Return true immediately when threshold is reached
+// 8-bit timer checks button state every 20ms (250 ticks = 5 seconds) to avoid 16-bit loop math
+static bool check_button_held(uint8_t intervals) {
+  while (!(PORTA.IN & PIN3_bm)) { // PA3 is LOW when pressed
+    _delay_ms(20);
+    intervals--;
+    if (intervals == 0) {
+      return true; // Threshold reached
     }
   }
   return false;
 }
 
-// Generates the unique key dynamically using Silicon ID + Master Key
+// Bypasses 32-bit compiler shift helpers by performing XOR and carry additions byte-by-byte
 static void derive_unique_key(uint32_t *destKey) {
   uint8_t sn[8];
   get_silicon_id_8(sn);
   
-  uint32_t serial_high = ((uint32_t)sn[0] << 24) | ((uint32_t)sn[1] << 16) | ((uint32_t)sn[2] << 8) | sn[3];
-  uint32_t serial_low  = ((uint32_t)sn[4] << 24) | ((uint32_t)sn[5] << 16) | ((uint32_t)sn[6] << 8) | sn[7];
+  uint8_t *dk = (uint8_t*)destKey;
+  const uint8_t *mk = (const uint8_t*)MASTER_KEY;
 
-  destKey[0] = MASTER_KEY[0] ^ serial_high;
-  destKey[1] = MASTER_KEY[1] ^ serial_low;
-  destKey[2] = MASTER_KEY[2] ^ (serial_high ^ serial_low);
-  destKey[3] = MASTER_KEY[3] ^ (serial_high + serial_low);
+  // destKey[0] = MASTER_KEY[0] ^ serial_high
+  dk[0] = mk[0] ^ sn[3];
+  dk[1] = mk[1] ^ sn[2];
+  dk[2] = mk[2] ^ sn[1];
+  dk[3] = mk[3] ^ sn[0];
+
+  // destKey[1] = MASTER_KEY[1] ^ serial_low
+  dk[4] = mk[4] ^ sn[7];
+  dk[5] = mk[5] ^ sn[6];
+  dk[6] = mk[6] ^ sn[5];
+  dk[7] = mk[7] ^ sn[4];
+
+  // destKey[2] = MASTER_KEY[2] ^ (serial_high ^ serial_low)
+  dk[8]  = mk[8]  ^ (sn[3] ^ sn[7]);
+  dk[9]  = mk[9]  ^ (sn[2] ^ sn[6]);
+  dk[10] = mk[10] ^ (sn[1] ^ sn[5]);
+  dk[11] = mk[11] ^ (sn[0] ^ sn[4]);
+
+  // destKey[3] = MASTER_KEY[3] ^ (serial_high + serial_low)
+  uint16_t carry = 0;
+  uint16_t sum0 = (uint16_t)sn[3] + sn[7];
+  dk[12] = mk[12] ^ (uint8_t)sum0;
+  carry = sum0 >> 8;
+
+  uint16_t sum1 = (uint16_t)sn[2] + sn[6] + carry;
+  dk[13] = mk[13] ^ (uint8_t)sum1;
+  carry = sum1 >> 8;
+
+  uint16_t sum2 = (uint16_t)sn[1] + sn[5] + carry;
+  dk[14] = mk[14] ^ (uint8_t)sum2;
+  carry = sum2 >> 8;
+
+  uint16_t sum3 = (uint16_t)sn[0] + sn[4] + carry;
+  dk[15] = mk[15] ^ (uint8_t)sum3;
+}
+
+// Custom register-level EEPROM write function to save libc library bloat
+static void my_eeprom_write_byte(uint8_t offset, uint8_t value) {
+  while (NVMCTRL.STATUS & NVMCTRL_EEBUSY_bm);
+  CPU_CCP = CCP_SPM_gc;
+  NVMCTRL.CTRLA = NVMCTRL_CMD_NONE_gc;
+  *(volatile uint8_t*)(EEPROM_BASE + offset) = value;
+  CPU_CCP = CCP_SPM_gc;
+  NVMCTRL.CTRLA = NVMCTRL_CMD_PAGEERASEWRITE_gc;
 }
 
 void setup() {
   wdt_disable();
   set_clock_full_speed();
 
-  pinMode(PROBE_DRIVE, OUTPUT);
-  digitalWrite(PROBE_DRIVE, LOW);
-  pinMode(PROBE_SENSE, INPUT);
-  pinMode(TX_DATA, OUTPUT);
-  tx_write(false);
+  // Configure PA1 (RF) and PA2 (Drive) as outputs
+  PORTA.DIRSET = PIN1_bm | PIN2_bm;
+  PORTA.OUTCLR = PIN1_bm | PIN2_bm;
 
-  pinMode(BTN_PIN, INPUT_PULLUP);
+  // Configure Button PA3 and Probes (PA4, PA5, PA6, PA7, PB3) with Pull-ups enabled in a small register loop
+  volatile uint8_t *pinCtrl = &PORTA.PIN3CTRL;
+  for (uint8_t i = 0; i < 5; i++) {
+    pinCtrl[i] = PORT_PULLUPEN_bm;
+  }
+  PORTB.PIN3CTRL = PORT_PULLUPEN_bm;
   
-  uint8_t activationStatus = eeprom_read_byte((const uint8_t*)EE_ACT_ADDR);
+  // Memory-mapped EEPROM read
+  uint8_t activationStatus = *(volatile uint8_t*)(EEPROM_BASE + EE_ACT_ADDR);
 
   // 1. First Boot Activation & Pairing Window
   if (activationStatus != 0x55) {
     while (true) {
-      if (digitalRead(BTN_PIN) == LOW) {
-        if (check_button_held(5000)) { // 5-second pairing hold
+      if (!(PORTA.IN & PIN3_bm)) { // Button PA3 pressed
+        if (check_button_held(250)) { // 250 * 20ms = 5-second pairing hold
           // Derive the Unique Key from Silicon ID and write it to EEPROM
           uint32_t derivedKey[4];
           derive_unique_key(derivedKey);
           
-          eeprom_write_block((const void*)derivedKey, (void*)EE_KEY_ADDR, 16);
-          eeprom_write_byte((uint8_t*)EE_ACT_ADDR, 0x55);
+          for (uint8_t i = 0; i < 16; i++) {
+            my_eeprom_write_byte(EE_KEY_ADDR + i, ((uint8_t*)derivedKey)[i]);
+          }
+          my_eeprom_write_byte(EE_ACT_ADDR, 0x55);
           
           // Generate pairing packet plaintext: contains the 8 bytes of Silicon ID
           uint8_t pairPayload[8];
           get_silicon_id_8(pairPayload);
 
           // Encrypt pairing packet with Factory Master Key
-          xtea_encrypt(32, (uint32_t*)pairPayload, MASTER_KEY);
+          xtea_encrypt((uint32_t*)pairPayload, MASTER_KEY);
           
           // Broadcast pairing packet aggressively
-          for (uint8_t r = 0; r < 10; r++) {
-            radio_send(pairPayload, 8);
-            _delay_ms(PACKET_GAP_MS);
-          }
+          send_packet_repeats(pairPayload, 10);
 
           // Now wait for user to release the button
-          while (digitalRead(BTN_PIN) == LOW) {
+          while (!(PORTA.IN & PIN3_bm)) {
             _delay_ms(10);
           }
           break;
         }
       }
-      PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Wake on button
+      PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Wake on button
       set_sleep_mode(SLEEP_MODE_PWR_DOWN);
       sei();
       sleep_mode();
       cli();
-      PORTA.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
+      PORTA.PIN3CTRL = PORT_PULLUPEN_bm;
     }
   }
 
-  // 2. Normal Boots: load the derived Unique Key from EEPROM
-  eeprom_read_block((void*)activeKey, (const void*)EE_KEY_ADDR, 16);
+  // 2. Normal Boots: load the derived Unique Key from memory-mapped EEPROM
+  for (uint8_t i = 0; i < 16; i++) {
+    ((uint8_t*)activeKey)[i] = *(volatile uint8_t*)(EEPROM_BASE + EE_KEY_ADDR + i);
+  }
   
   configure_pit_sleep();
 }
@@ -382,12 +358,10 @@ void loop() {
   sei();
   
   // Debounced Button checks
-  if (digitalRead(BTN_PIN) == LOW) {
-    if (check_button_held(5000)) {
-      // 5-second hold: Toggle AUTO/MANUAL mode
+  if (!(PORTA.IN & PIN3_bm)) {
+    if (check_button_held(250)) { // 250 * 20ms = 5-second hold: Toggle AUTO/MANUAL mode
       manualMode = !manualMode;
       manualOn = false;
-      activeFilling = false;
       
       if (manualMode) {
         configure_pit_off();
@@ -396,14 +370,14 @@ void loop() {
       }
       
       // Wait for release before returning
-      while (digitalRead(BTN_PIN) == LOW) {
+      while (!(PORTA.IN & PIN3_bm)) {
         _delay_ms(10);
       }
     } else {
       // Short press: Toggle MANUAL State
       if (manualMode) {
         manualOn = !manualOn;
-        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_TOGGLE, activeKey);
+        encrypt_and_send(reportedLevel, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_TOGGLE);
         
         if (manualOn) {
           configure_pit_sleep();
@@ -422,39 +396,13 @@ void loop() {
     if (manualMode) {
       if (manualOn) {
         // Send manual keepalive
-        encrypt_and_send(reportedLevel, false, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_KEEP, activeKey);
+        encrypt_and_send(reportedLevel, MSG_MANUAL_CMD, FLAG_MANUAL_MODE | FLAG_MANUAL_KEEP);
       }
     } else {
       // Normal Auto water level checks
-      bool levelChanged = false;
-      uint8_t level = read_filtered_level(&levelChanged);
-
-      if (level <= 1) {
-        if (!activeFilling) {
-          activeFilling = true;
-          fillTimerTicks = 0;
-        }
-      }
-
-      if (activeFilling) {
-        fillTimerTicks++;
-        if (level >= 4) {
-          activeFilling = false;
-          if (learnedFillTicks == 0) {
-            learnedFillTicks = fillTimerTicks;
-          } else {
-            learnedFillTicks = (learnedFillTicks * 3 + fillTimerTicks) / 4;
-          }
-          allowedFillTicks = learnedFillTicks * 2;
-          if (allowedFillTicks < MIN_FILL_TIMEOUT_TICKS) allowedFillTicks = MIN_FILL_TIMEOUT_TICKS;
-          if (allowedFillTicks > MAX_FILL_TIMEOUT_TICKS) allowedFillTicks = MAX_FILL_TIMEOUT_TICKS;
-        }
-        
-        if (fillTimerTicks >= allowedFillTicks) {
-          activeFilling = false;
-          encrypt_and_send(level, false, MSG_AUTO_REPORT, FLAG_FILL_TIMEOUT, activeKey);
-        }
-      }
+      uint8_t level = read_digital_level();
+      bool levelChanged = (level != reportedLevel);
+      reportedLevel = level;
 
       // Transmit requirement decision
       bool shouldSend = false;
@@ -464,7 +412,8 @@ void loop() {
         shouldSend = true;
         if (level == 0) dryWakeCount = 0;
         if (level == 5) overflowWakeCount = 0;
-      } else if (activeFilling) {
+      } else if (level < 4) {
+        // Keep sending periodically during filling (level 1 to 3) to keep link alive
         shouldSend = true;
       } else if (level == 0) {
         if (dryWakeCount < DRY_REPORT_WAKE_COUNT) {
@@ -487,20 +436,31 @@ void loop() {
       }
 
       if (shouldSend) {
-        encrypt_and_send(level, levelChanged, MSG_AUTO_REPORT, extraFlags, activeKey);
+        uint8_t flags = extraFlags;
+        if (levelChanged) flags |= FLAG_LEVEL_CHANGED;
+        encrypt_and_send(level, MSG_AUTO_REPORT, flags);
       }
     }
   }
 
   // Configure sleep wakes
   if (manualMode && !manualOn) {
-    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Button wake only
+    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Button wake only
   } else {
-    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc; // Wake on button OR PIT tick
+    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Wake on button OR PIT tick
   }
   
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_mode();
   
-  PORTA.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
+  PORTA.PIN3CTRL = PORT_PULLUPEN_bm;
+}
+
+// Bypasses the Arduino core boilerplate setup/loop wrapper
+int main(void) {
+  setup();
+  while (1) {
+    loop();
+  }
+  return 0;
 }
