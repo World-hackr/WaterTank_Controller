@@ -10,7 +10,6 @@ const uint8_t testPins[] = {
   PIN_PA2, // Pin 5 (Relay Output)
   PIN_PA3  // Pin 7 (Button Input / Status LED)
 };
-
 const uint8_t pinCount = sizeof(testPins) / sizeof(testPins[0]);
 
 void setup() {
