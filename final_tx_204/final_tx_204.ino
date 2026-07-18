@@ -4,17 +4,17 @@
 #include <avr/interrupt.h>
 #include <util/delay.h>
 
-// --- Port-mapped Pin Configurations ---
-#define TX_DATA_PIN_bm  PIN1_bm // PA1 (Pin 11) - RF Data Out
-#define DRIVE_PIN_bm    PIN2_bm // PA2 (Pin 12) - Common Probe Drive
-#define BTN_PIN_bm      PIN3_bm // PA3 (Pin 13) - Manual Button Input
-#define STATUS_LED_bm   PIN0_bm // PB0 (Pin 9)  - Status/Pairing LED
+// --- Port-mapped Pin Configurations (User PCB Layout) ---
+#define TX_DATA_PIN_bm  PIN4_bm // PA4 (Pin 2)  - RF Data Out
+#define DRIVE_PIN_bm    PIN6_bm // PA6 (Pin 4)  - Common Probe Drive (Active HIGH)
+#define BTN_PIN_bm      PIN7_bm // PA7 (Pin 5)  - Manual Button Input (Active LOW)
+#define STATUS_LED_bm   PIN0_bm // PB0 (Pin 9)  - Status/Pairing LED (Active HIGH)
 
-// Level Probes (Contiguous on Port A: Pins 2, 3, 4, 5)
-#define PROBE_L1_bm     PIN4_bm // PA4 (Pin 2)
-#define PROBE_L2_bm     PIN5_bm // PA5 (Pin 3)
-#define PROBE_L3_bm     PIN6_bm // PA6 (Pin 4)
-#define PROBE_L4_bm     PIN7_bm // PA7 (Pin 5)
+// Level Probes (with external 1M pull-downs and 6.7k series resistors)
+#define PROBE_L1_bm     PIN1_bm // PA1 (Pin 11) - Probe Level 1
+#define PROBE_L2_bm     PIN2_bm // PA2 (Pin 12) - Probe Level 2
+#define PROBE_L3_bm     PIN3_bm // PA3 (Pin 13) - Probe Level 3
+#define PROBE_L4_bm     PIN5_bm // PA5 (Pin 3)  - Probe Level 4
 
 // --- Protocol Constants ---
 #define BIT_US 1000
@@ -137,24 +137,24 @@ static void send_pairing_packet() {
   send_packet_repeats(pairPayload, REPEATS_PER_PACKET);
 }
 
-// Reads 4 digital probe pins to determine water level (0 to 4)
+// Reads 4 digital probe pins to determine water level (0 to 4) - Active HIGH
 static uint8_t read_digital_level() {
-  // Drive common line LOW
-  PORTA.OUTCLR = DRIVE_PIN_bm;
+  // Drive common line HIGH
+  PORTA.OUTSET = DRIVE_PIN_bm;
   PORTA.DIRSET = DRIVE_PIN_bm; 
   _delay_us(10); // Let line settle
 
   uint8_t level = 0;
   
-  // Probes are Active LOW (pulled to GND by water)
-  if (!(PORTA.IN & PROBE_L1_bm)) level = 1; 
-  if (!(PORTA.IN & PROBE_L2_bm)) level = 2; 
-  if (!(PORTA.IN & PROBE_L3_bm)) level = 3; 
-  if (!(PORTA.IN & PROBE_L4_bm)) level = 4; 
+  // Probes are Active HIGH (pulled to 3.3V by water)
+  if (PORTA.IN & PROBE_L1_bm) level = 1; 
+  if (PORTA.IN & PROBE_L2_bm) level = 2; 
+  if (PORTA.IN & PROBE_L3_bm) level = 3; 
+  if (PORTA.IN & PROBE_L4_bm) level = 4; 
 
   // Turn off drive pin (pull to High-Z input to prevent corrosion)
   PORTA.DIRCLR = DRIVE_PIN_bm;
-  PORTA.OUTSET = DRIVE_PIN_bm;
+  PORTA.OUTCLR = DRIVE_PIN_bm;
 
   return level;
 }
@@ -281,7 +281,7 @@ void setup() {
   wdt_disable();
   set_clock_full_speed();
 
-  // Configure PA1 (RF) and PA2 (Drive) as outputs
+  // Configure Data and Drive pins as outputs
   PORTA.DIRSET = TX_DATA_PIN_bm | DRIVE_PIN_bm;
   PORTA.OUTCLR = TX_DATA_PIN_bm | DRIVE_PIN_bm;
 
@@ -289,13 +289,16 @@ void setup() {
   PORTB.DIRSET = STATUS_LED_bm;
   PORTB.OUTCLR = STATUS_LED_bm;
 
-  // Configure Button PA3 and Probes (PA4, PA5, PA6, PA7) with Pull-ups enabled
-  volatile uint8_t *pinCtrl = &PORTA.PIN3CTRL;
-  for (uint8_t i = 0; i < 5; i++) {
-    pinCtrl[i] = PORT_PULLUPEN_bm;
-  }
+  // Configure Button (PA7) with Pull-up enabled.
+  PORTA.PIN7CTRL = PORT_PULLUPEN_bm;
 
-  // Power Optimization: Disable digital input buffers on all unused Port B pins
+  // Disable internal pull-ups on Probes (PA1, PA2, PA3, PA5) to rely on external 1M pull-downs
+  PORTA.PIN1CTRL = 0;
+  PORTA.PIN2CTRL = 0;
+  PORTA.PIN3CTRL = 0;
+  PORTA.PIN5CTRL = 0;
+
+  // Disable digital input buffers on other unused Port B pins for power saving
   PORTB.PIN1CTRL = PORT_ISC_INPUT_DISABLE_gc;
   PORTB.PIN2CTRL = PORT_ISC_INPUT_DISABLE_gc;
   PORTB.PIN3CTRL = PORT_ISC_INPUT_DISABLE_gc;
@@ -394,15 +397,15 @@ void loop() {
 
   // Configure sleep interrupts
   if (manualMode && !manualOn) {
-    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Wake on button only
+    PORTA.PIN7CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Wake on button only (PA7)
   } else {
-    PORTA.PIN3CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Wake on button OR PIT timer
+    PORTA.PIN7CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm; // Wake on button OR PIT timer (PA7)
   }
   
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_mode();
   
-  PORTA.PIN3CTRL = PORT_PULLUPEN_bm;
+  PORTA.PIN7CTRL = PORT_PULLUPEN_bm;
 }
 
 // Bypasses Arduino core setup/loop template to minimize vector and initialization size
