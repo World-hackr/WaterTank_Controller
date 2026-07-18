@@ -10,6 +10,7 @@
 // Level Probes (with external 1M pull-downs and 6.7k series resistors)
 #define PROBE_L1_bm     PIN1_bm // PA1 (Pin 11) - Probe Level 1
 #define PROBE_L2_bm     PIN2_bm // PA2 (Pin 12) - Probe Level 2
+
 #define PROBE_L3_bm     PIN3_bm // PA3 (Pin 13) - Probe Level 3
 #define PROBE_L4_bm     PIN5_bm // PA5 (Pin 3)  - Probe Level 4
 

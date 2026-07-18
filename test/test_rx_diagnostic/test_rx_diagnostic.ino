@@ -182,8 +182,15 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // 1. Local Button Test: Pressing Receiver's own button turns all 6 LEDs ON
-  bool localButtonPressed = !(PORTA.IN & RX_DATA_PIN_bm); // PA1 LOW
+  // 1. Local Button Test: Pressing Receiver's own button (held for 200ms) turns all 6 LEDs ON
+  bool localButtonPressed = false;
+  if (!(PORTA.IN & RX_DATA_PIN_bm)) {
+    _delay_ms(200); // Debounce delay
+    if (!(PORTA.IN & RX_DATA_PIN_bm)) {
+      localButtonPressed = true;
+    }
+  }
+  
   if (localButtonPressed) {
     for (uint8_t led = 1; led <= 6; led++) {
       drive_led(led);
