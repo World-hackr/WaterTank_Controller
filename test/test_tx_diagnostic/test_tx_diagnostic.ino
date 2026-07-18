@@ -84,11 +84,6 @@ static void send_packet_repeats(const uint8_t *payload, uint8_t repeats) {
 
 // Reads 4 digital probe pins to determine water level (0 to 4) - Active HIGH
 static uint8_t read_digital_level() {
-  // Drive common line HIGH
-  PORTA.OUTSET = DRIVE_PIN_bm;
-  PORTA.DIRSET = DRIVE_PIN_bm; 
-  _delay_us(10); // Let line settle
-
   uint8_t level = 0;
   
   // Probes are Active HIGH (pulled to 3.3V by water)
@@ -96,10 +91,6 @@ static uint8_t read_digital_level() {
   if (PORTA.IN & PROBE_L2_bm) level = 2; 
   if (PORTA.IN & PROBE_L3_bm) level = 3; 
   if (PORTA.IN & PROBE_L4_bm) level = 4; 
-
-  // Turn off drive pin (pull to High-Z input)
-  PORTA.DIRCLR = DRIVE_PIN_bm;
-  PORTA.OUTCLR = DRIVE_PIN_bm;
 
   return level;
 }
@@ -128,7 +119,8 @@ void setup() {
 
   // Configure Data and Drive pins as outputs
   PORTA.DIRSET = TX_DATA_PIN_bm | DRIVE_PIN_bm;
-  PORTA.OUTCLR = TX_DATA_PIN_bm | DRIVE_PIN_bm;
+  PORTA.OUTCLR = TX_DATA_PIN_bm;
+  PORTA.OUTSET = DRIVE_PIN_bm; // Keep Drive Pin HIGH continuously for testing
 
   // Configure Status LED on Port B as output
   PORTB.DIRSET = STATUS_LED_bm;

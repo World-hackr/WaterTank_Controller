@@ -37,6 +37,7 @@ uint8_t rxLevel = 0;
 uint8_t rxButton = 1; // 1 = released, 0 = pressed
 uint32_t lastPacketTimeMs = 0;
 uint32_t heartbeatLedOffMs = 0;
+uint32_t buttonLowStartMs = 0;
 bool showHeartbeat = false;
 
 // We use the Arduino core millis() for display timing in the main loop
@@ -182,13 +183,16 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // 1. Local Button Test: Pressing Receiver's own button (held for 200ms) turns all 6 LEDs ON
+  // 1. Local Button Test: Pressing Receiver's own button (held for 150ms non-blocking) turns all 6 LEDs ON
   bool localButtonPressed = false;
   if (!(PORTA.IN & RX_DATA_PIN_bm)) {
-    _delay_ms(200); // Debounce delay
-    if (!(PORTA.IN & RX_DATA_PIN_bm)) {
+    if (buttonLowStartMs == 0) {
+      buttonLowStartMs = now;
+    } else if (now - buttonLowStartMs > 150) {
       localButtonPressed = true;
     }
+  } else {
+    buttonLowStartMs = 0;
   }
   
   if (localButtonPressed) {
