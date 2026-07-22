@@ -255,7 +255,7 @@ static void update_desired_pump(uint8_t probeMask) {
     desiredPump = false;
     idleStartSamples = 0;
     idleStartVotes = 0;
-  } else if (probeMask & 0x01) {
+  } else if (!(probeMask & 0x02)) { // Probe 2 is dry -> start pump! (covers Level 1 and Level 0)
     if (desiredPump) return;
     idleStartVotes++;
     if (++idleStartSamples >= IDLE_START_WINDOW) {
@@ -263,15 +263,7 @@ static void update_desired_pump(uint8_t probeMask) {
       idleStartSamples = 0;
       idleStartVotes = 0;
     }
-  } else if (probeMask == 0) {
-    if (desiredPump) return;
-    idleStartVotes++;
-    if (++idleStartSamples >= IDLE_START_WINDOW) {
-      desiredPump = idleStartVotes >= IDLE_START_REQUIRED;
-      idleStartSamples = 0;
-      idleStartVotes = 0;
-    }
-  } else {
+  } else { // Probe 2 is wet -> hold state
     if (desiredPump) return;
     if (++idleStartSamples >= IDLE_START_WINDOW) {
       idleStartSamples = 0;
@@ -300,6 +292,10 @@ void setup() {
 
   derive_unique_key(activeKey);
   configure_pit_sleep();
+
+  // Runtime Override: Disable BOD during Sleep to save battery leakage
+  CPU_CCP = CCP_IOREG_gc;
+  BOD.CTRLA = (BOD.CTRLA & ~BOD_SLEEP_gm) | BOD_SLEEP_DIS_gc;
 }
 
 void loop() {
@@ -331,7 +327,7 @@ void loop() {
     }
   }
 
-  PORTA.PIN7CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm;
+  PORTA.PIN7CTRL = PORT_ISC_FALLING_gc | PORT_PULLUPEN_bm;
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_mode();
   PORTA.PIN7CTRL = PORT_PULLUPEN_bm;
