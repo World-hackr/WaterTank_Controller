@@ -42,6 +42,8 @@
 #define RX_FILL_TIMEOUT_MAX_MS     3600000UL // 60 minutes
 #define MANUAL_MAX_RUNTIME_MS      600000UL  // 10 minutes
 #define FILL_KEEP_TIMEOUT_MS       24000UL   // 3 missed packets (24 seconds)
+#define PAIRING_HOLD_MS            10000UL
+#define MANUAL_TOGGLE_GUARD_MS     2000UL
 
 // EEPROM base and offsets (memory-mapped at 0x1400)
 #define EEPROM_BASE 0x1400
@@ -85,11 +87,14 @@ bool manualRelayOn = false;
 uint8_t faultState = FAULT_NONE;
 bool havePacket = false;
 bool inPairingMode = false;
+uint8_t pairingCandidate[8];
+uint8_t pairingCandidateCount = 0;
 
 // Timers
 uint32_t lastGoodPacketMs = 0;
 uint32_t fillStartTimeMs = 0;
 uint32_t manualStartTimeMs = 0;
+uint32_t lastManualToggleMs = 0;
 uint32_t allowedFillTimeMs = RX_FILL_TIMEOUT_DEFAULT_MS;
 uint32_t learnedFillTimeMs = 0;
 
@@ -385,10 +390,10 @@ void loop() {
   uint32_t now = millis();
 
   // 1. Check for manual button press on RX_DATA line (PA1)
-  if (!(PORTA.IN & RX_DATA_PIN_bm)) { // Pin is LOW when button is pressed
+  if (!havePacket && !(PORTA.IN & RX_DATA_PIN_bm)) { // Pin is LOW when button is pressed
     if (buttonLowStartMs == 0) {
       buttonLowStartMs = now;
-    } else if ((now - buttonLowStartMs > 1000UL) && !buttonHeldActive) {
+    } else if ((now - buttonLowStartMs > PAIRING_HOLD_MS) && !buttonHeldActive) {
       buttonHeldActive = true;
       
       if (faultState != FAULT_NONE) {
@@ -397,7 +402,7 @@ void loop() {
         autoRelayOn = false;
         manualRelayOn = false;
         trigger_pairing_confirmation_blinks();
-      } else if (now - buttonLowStartMs > 3000UL) {
+      } else {
         // 3-second hold: Clear paired status and enter Pairing Mode
         my_eeprom_write_byte(EE_ID_ADDR + 0, 0xFF);
         my_eeprom_write_byte(EE_ID_ADDR + 1, 0xFF);
@@ -426,9 +431,18 @@ void loop() {
       xtea_decrypt(32, (uint32_t*)ciphertext, activeKey);
       
       if (inPairingMode) {
-        // Verification of pairing package: decrypts with MASTER_KEY.
-        // It must contain the 8-byte Silicon ID, starting with factory signature 0x3055
-        if (ciphertext[0] == 0x30 && ciphertext[1] == 0x55) {
+        bool sameCandidate = true;
+        for (uint8_t i = 0; i < 8; i++) {
+          if (pairingCandidate[i] != ciphertext[i]) sameCandidate = false;
+        }
+        if (!sameCandidate) {
+          for (uint8_t i = 0; i < 8; i++) pairingCandidate[i] = ciphertext[i];
+          pairingCandidateCount = 1;
+        } else if (pairingCandidateCount < 2) {
+          pairingCandidateCount++;
+        }
+
+        if (pairingCandidateCount >= 2) {
           // 1. Calculate the Unique Key dynamically on the RX
           uint32_t serial_high = ((uint32_t)ciphertext[0] << 24) | ((uint32_t)ciphertext[1] << 16) | ((uint32_t)ciphertext[2] << 8) | ciphertext[3];
           uint32_t serial_low  = ((uint32_t)ciphertext[4] << 24) | ((uint32_t)ciphertext[5] << 16) | ((uint32_t)ciphertext[6] << 8) | ciphertext[7];
@@ -453,6 +467,7 @@ void loop() {
           pairedId[0] = rxId[0]; pairedId[1] = rxId[1]; pairedId[2] = rxId[2];
           
           inPairingMode = false;
+          pairingCandidateCount = 0;
           trigger_pairing_confirmation_blinks();
         }
       } else {
@@ -467,7 +482,9 @@ void loop() {
           
           // Replay check
           uint8_t diff = seq - lastSequence;
-          if (havePacket && diff >= 128 && seq != lastSequence) {
+          if (havePacket && seq == lastSequence) {
+            // Duplicate repeat, reject
+          } else if (havePacket && diff >= 128) {
             // Out of order packet, reject
           } else {
             // Accept packet
@@ -480,9 +497,12 @@ void loop() {
             // Process commands
             if (msgType == MSG_MANUAL_CMD) {
               if (flags & FLAG_MANUAL_TOGGLE) {
-                manualRelayOn = !manualRelayOn;
-                autoRelayOn = false;
-                if (manualRelayOn) manualStartTimeMs = now;
+                if (lastManualToggleMs == 0 || now - lastManualToggleMs >= MANUAL_TOGGLE_GUARD_MS) {
+                  lastManualToggleMs = now;
+                  manualRelayOn = !manualRelayOn;
+                  autoRelayOn = false;
+                  if (manualRelayOn) manualStartTimeMs = now;
+                }
               } else if (flags & FLAG_MANUAL_KEEP) {
                 if (manualRelayOn) {
                   // Keepalive confirm, do not reset manual runtime timer

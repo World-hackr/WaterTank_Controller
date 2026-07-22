@@ -190,9 +190,9 @@ static void encrypt_and_send(uint8_t level, uint8_t msgType, uint8_t flags) {
   plaintext[4] = flags;
   
   // Bytes 5-7 contain the last 3 bytes of the Silicon ID
-  plaintext[5] = *(volatile uint8_t*)(0x110A);
-  plaintext[6] = *(volatile uint8_t*)(0x110B);
-  plaintext[7] = *(volatile uint8_t*)(0x110C);
+  plaintext[5] = *(volatile uint8_t*)(0x1108);
+  plaintext[6] = *(volatile uint8_t*)(0x1109);
+  plaintext[7] = *(volatile uint8_t*)(0x110A);
 
   // Encrypt in-place using the global activeKey
   xtea_encrypt((uint32_t*)plaintext, activeKey);
