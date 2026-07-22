@@ -53,6 +53,11 @@ uint8_t startupPairCount = 4;
 uint8_t idleStartSamples = 0;
 uint8_t idleStartVotes = 0;
 
+static void set_clock_full_speed() {
+  CPU_CCP = CCP_IOREG_gc;
+  CLKCTRL.MCLKCTRLB = 0x00; // Prescaler divisor 1 (20MHz internal)
+}
+
 static void get_pair_identity(uint8_t *id) {
   id[0] = PAIR_MAGIC_0;
   id[1] = PAIR_MAGIC_1;
@@ -255,7 +260,7 @@ static void update_desired_pump(uint8_t probeMask) {
     desiredPump = false;
     idleStartSamples = 0;
     idleStartVotes = 0;
-  } else if (!(probeMask & 0x02)) { // Probe 2 is dry -> start pump! (covers Level 1 and Level 0)
+  } else if (probeMask & 0x01) {
     if (desiredPump) return;
     idleStartVotes++;
     if (++idleStartSamples >= IDLE_START_WINDOW) {
@@ -263,7 +268,15 @@ static void update_desired_pump(uint8_t probeMask) {
       idleStartSamples = 0;
       idleStartVotes = 0;
     }
-  } else { // Probe 2 is wet -> hold state
+  } else if (probeMask == 0) {
+    if (desiredPump) return;
+    idleStartVotes++;
+    if (++idleStartSamples >= IDLE_START_WINDOW) {
+      desiredPump = idleStartVotes >= IDLE_START_REQUIRED;
+      idleStartSamples = 0;
+      idleStartVotes = 0;
+    }
+  } else {
     if (desiredPump) return;
     if (++idleStartSamples >= IDLE_START_WINDOW) {
       idleStartSamples = 0;
@@ -274,6 +287,7 @@ static void update_desired_pump(uint8_t probeMask) {
 
 void setup() {
   wdt_disable();
+  set_clock_full_speed();
 
   PORTA.DIRSET = TX_DATA_PIN_bm | DRIVE_PIN_bm;
   PORTA.OUTCLR = TX_DATA_PIN_bm | DRIVE_PIN_bm;
@@ -292,10 +306,6 @@ void setup() {
 
   derive_unique_key(activeKey);
   configure_pit_sleep();
-
-  // Runtime Override: Disable BOD during Sleep to save battery leakage
-  CPU_CCP = CCP_IOREG_gc;
-  BOD.CTRLA = (BOD.CTRLA & ~BOD_SLEEP_gm) | BOD_SLEEP_DIS_gc;
 }
 
 void loop() {
@@ -327,7 +337,7 @@ void loop() {
     }
   }
 
-  PORTA.PIN7CTRL = PORT_ISC_FALLING_gc | PORT_PULLUPEN_bm;
+  PORTA.PIN7CTRL = PORT_ISC_LEVEL_gc | PORT_PULLUPEN_bm;
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_mode();
   PORTA.PIN7CTRL = PORT_PULLUPEN_bm;
