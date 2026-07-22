@@ -64,7 +64,9 @@ static void get_pair_identity(uint8_t *id) {
   for (uint8_t i = 2; i < 8; i++) id[i] = *(volatile uint8_t*)(0x1103 + i);
 }
 
-static void xtea_encrypt(uint32_t v[2], uint32_t const k[4]) {
+static void xtea_encrypt(uint8_t payload[8], uint32_t const k[4]) {
+  uint32_t v[2];
+  for (uint8_t i = 0; i < 8; i++) ((uint8_t*)v)[i] = payload[i];
   uint32_t v0 = v[0], v1 = v[1], sum = 0, delta = 0x9E3779B9;
   for (uint8_t i = 0; i < 32; i++) {
     v0 += (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + k[sum & 3]);
@@ -72,6 +74,7 @@ static void xtea_encrypt(uint32_t v[2], uint32_t const k[4]) {
     v1 += (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + k[(sum >> 11) & 3]);
   }
   v[0] = v0; v[1] = v1;
+  for (uint8_t i = 0; i < 8; i++) payload[i] = ((uint8_t*)v)[i];
 }
 
 static uint16_t crc16_update(uint16_t crc, uint8_t data) {
@@ -126,7 +129,7 @@ static void send_packet_repeats(const uint8_t *payload) {
 static void send_pairing_packet() {
   uint8_t payload[8];
   get_pair_identity(payload);
-  xtea_encrypt((uint32_t*)payload, MASTER_KEY);
+  xtea_encrypt(payload, MASTER_KEY);
   send_packet_repeats(payload);
 }
 
@@ -179,7 +182,7 @@ static void encrypt_and_send(uint8_t probeMask, uint8_t msgType, bool pumpReques
   plaintext[6] = *(volatile uint8_t*)(0x1109);
   plaintext[7] = *(volatile uint8_t*)(0x110A);
 
-  xtea_encrypt((uint32_t*)plaintext, activeKey);
+  xtea_encrypt(plaintext, activeKey);
   send_packet_repeats(plaintext);
   sequenceId++;
 }
