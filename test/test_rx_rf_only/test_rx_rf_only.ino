@@ -177,31 +177,26 @@ void loop() {
   uint8_t len = sizeof(packet);
   if (radio_recv(packet, &len)) {
     if (len == 8 && packet[0] == 0x99) {
-      currentCount = packet[1]; // Get count (1 to 4)
+      currentCount = packet[1]; // Get count (0 to 15)
       lastGoodPacketMs = now;
-      heartbeatOn = true;
-      blinkEndMs = now + 150; // Blink LED 6 for 150ms
     }
   }
 
-  // Display scan loop
-  if (heartbeatOn && (now < blinkEndMs)) {
-    // LED 6 = Packet received indicator
-    drive_led(6);
-    _delay_ms(2);
+  // 1. LED 1 (Red) mirrors the raw RF input pin state directly to show signal flicker/noise
+  bool rfPinState = (PORTA.IN & RX_DATA_PIN_bm) != 0;
+  if (rfPinState) {
+    drive_led(1);
+    _delay_us(500);
   } else {
-    heartbeatOn = false;
+    leds_off();
   }
 
-  // Show count on LEDs 1 to 4
+  // 2. LEDs 2 to 5 show the packet number in 4-bit binary (only if packet received recently)
   if (now - lastGoodPacketMs < 3000) {
-    uint8_t showLeds = currentCount > 4 ? 4 : currentCount;
-    for (uint8_t led = 1; led <= 4; led++) {
-      if (led <= showLeds) {
-        drive_led(led);
-        _delay_ms(2);
-      }
-    }
+    if (currentCount & 0x01) { drive_led(2); _delay_us(500); }
+    if (currentCount & 0x02) { drive_led(3); _delay_us(500); }
+    if (currentCount & 0x04) { drive_led(4); _delay_us(500); }
+    if (currentCount & 0x08) { drive_led(5); _delay_us(500); }
   }
 
   leds_off();

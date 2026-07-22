@@ -98,9 +98,9 @@ void loop() {
 
   PORTB.OUTCLR = STATUS_LED_bm;
 
-  // Rotate counter 1 to 4
+  // Rotate counter 0 to 15
   counter++;
-  if (counter > 4) counter = 1;
+  if (counter > 15) counter = 0;
 
   // Wait 1 second before sending again
   _delay_ms(1000);
