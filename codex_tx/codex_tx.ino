@@ -260,7 +260,7 @@ static void update_desired_pump(uint8_t probeMask) {
     desiredPump = false;
     idleStartSamples = 0;
     idleStartVotes = 0;
-  } else if (probeMask & 0x01) {
+  } else if (probeMask == 0 || probeMask == 0x01) { // Start pump only at Level 0 or Level 1
     if (desiredPump) return;
     idleStartVotes++;
     if (++idleStartSamples >= IDLE_START_WINDOW) {
@@ -268,15 +268,7 @@ static void update_desired_pump(uint8_t probeMask) {
       idleStartSamples = 0;
       idleStartVotes = 0;
     }
-  } else if (probeMask == 0) {
-    if (desiredPump) return;
-    idleStartVotes++;
-    if (++idleStartSamples >= IDLE_START_WINDOW) {
-      desiredPump = idleStartVotes >= IDLE_START_REQUIRED;
-      idleStartSamples = 0;
-      idleStartVotes = 0;
-    }
-  } else {
+  } else { // All other levels -> hold state
     if (desiredPump) return;
     if (++idleStartSamples >= IDLE_START_WINDOW) {
       idleStartSamples = 0;

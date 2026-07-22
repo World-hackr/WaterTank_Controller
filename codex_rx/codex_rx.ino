@@ -39,7 +39,7 @@
 #define PAIRING_HOLD_MS            5000UL
 #define SEQUENCE_RESYNC_MS         16000UL   // Debug value; use 120000UL for production
 #define SEQUENCE_WINDOW            100
-#define BATTERY_LOW_CODE           150
+#define BATTERY_LOW_CODE           100       // Threshold adjusted to ~2.8V VDD
 
 #define PAIR_MAGIC_0 0xC3
 #define PAIR_MAGIC_1 0x3C
