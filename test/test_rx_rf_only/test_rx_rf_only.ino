@@ -5,6 +5,9 @@
 
 // --- Pin Settings (ATtiny402) ---
 #define RX_DATA_PIN_bm   PIN1_bm // PA1 (Pin 4) - RF Data Input
+#define RELAY_PIN_bm     PIN2_bm // PA2 (Pin 5) - Pump Relay Control
+#define BTN_PA0_PIN_bm   PIN0_bm // PA0 (Pin 6) - Onboard Button (Active LOW)
+
 #define LINE_A_bm        PIN6_bm // PA6 (Pin 2) - Charlieplex Line A
 #define LINE_B_bm        PIN7_bm // PA7 (Pin 3) - Charlieplex Line B
 #define LINE_C_bm        PIN3_bm // PA3 (Pin 7) - Charlieplex Line C
@@ -163,7 +166,12 @@ static bool radio_recv(uint8_t *payload, uint8_t *len) {
 void setup() {
   set_clock_full_speed();
   leds_off();
-  PORTA.DIRCLR = RX_DATA_PIN_bm;
+  PORTA.DIRCLR = RX_DATA_PIN_bm | BTN_PA0_PIN_bm;
+  PORTA.DIRSET = RELAY_PIN_bm;
+  PORTA.OUTCLR = RELAY_PIN_bm;
+
+  // Enable internal pull-up on PA0 (Pin 6)
+  PORTA.PIN0CTRL = PORT_PULLUPEN_bm;
 
   timer_setup();
   sei();
@@ -189,6 +197,14 @@ void loop() {
     _delay_us(500);
   } else {
     leds_off();
+  }
+
+  // Read button on PA0 (Pin 6) - Active LOW
+  bool btnPressed = !(PORTA.IN & BTN_PA0_PIN_bm);
+  if (btnPressed) {
+    PORTA.OUTSET = RELAY_PIN_bm; // Relay ON
+  } else {
+    PORTA.OUTCLR = RELAY_PIN_bm; // Relay OFF
   }
 
   // 2. LEDs 2 to 5 show the packet number in 4-bit binary (only if packet received recently)
